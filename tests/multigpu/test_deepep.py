@@ -72,6 +72,12 @@ def _env():
 
 
 def _init_dist(local_rank: int):
+    # deep_ep checks at import that every loaded libnccl* is one library; import
+    # it before NCCL starts, as sglang does, so an NCCL plugin that NCCL loads at
+    # communicator init (NCCL_TUNER_PLUGIN=ofi -> libnccl-tuner-ofi.so on EFA
+    # images) is not taken for a second NCCL runtime.
+    import deep_ep  # noqa: F401
+
     params = {
         "backend": "nccl",
         "init_method": f"tcp://127.0.0.1:{os.environ['MASTER_PORT']}",
