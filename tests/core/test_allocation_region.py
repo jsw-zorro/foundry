@@ -83,11 +83,14 @@ def _run_size_formats(archive):
     import foundry as fdry
 
     torch.cuda.init()
+    # Well below the mmap area near 0x7f...: a base there can collide with a
+    # mapping the process already has (an 8 GB PROT_NONE reservation at
+    # 0x7effb0000000 on one host), and the hook then disables the region.
     cases = [
-        (0x7F0000000000, "1GB"),
-        (0x7F1000000000, "512MB"),
-        (0x7F2000000000, "100MB"),
-        ("0x7f3000000000", 50 * MB),
+        (0x510000000000, "1GB"),
+        (0x511000000000, "512MB"),
+        (0x512000000000, "100MB"),
+        ("0x513000000000", 50 * MB),
     ]
     for base, size in cases:
         base_int = int(base, 16) if isinstance(base, str) else base
