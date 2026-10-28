@@ -13,6 +13,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/driver_api.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <limits>
 #include <mutex>
@@ -2009,6 +2010,30 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
           topology_key += ":0";
         }
       }
+    }
+    // The edges too. LOAD rebuilds a member on its template's graph, so the member runs with the
+    // template's edges (its own are not stored). Kernels that use programmatic dependent launch
+    // for some batch sizes only (FA3 prepare -> fwd on Hopper) give graphs with the same nodes
+    // and a programmatic edge in one size, a full one in another; a member that inherits a
+    // programmatic edge it did not have starts before its producer is done.
+    {
+      std::vector<std::array<uint32_t, 5>> edges;
+      edges.reserve(graph_dependencies.size());
+      for (const auto& dep : graph_dependencies)
+        edges.push_back({static_cast<uint32_t>(dep.from_index), static_cast<uint32_t>(dep.to_index),
+                         dep.from_port, dep.to_port, dep.edge_type});
+      std::sort(edges.begin(), edges.end());
+      uint64_t h = 1469598103934665603ull;  // FNV-1a over the sorted edge list
+      for (const auto& e : edges)
+        for (uint32_t v : e)
+          for (int b = 0; b < 4; ++b) {
+            h ^= (v >> (8 * b)) & 0xffu;
+            h *= 1099511628211ull;
+          }
+      std::ostringstream edge_key;
+      edge_key << "|E" << edges.size() << ':' << std::hex << std::setw(16) << std::setfill('0')
+               << h;
+      topology_key += edge_key.str();
     }
     root["topology_key"] = topology_key;
   }
