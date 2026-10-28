@@ -1877,9 +1877,14 @@ void CUDAGraph::link_on_demand_shared_exec(CUDAGraph& graph,
       CUkernelNodeAttrValue cluster{}, preferred{};
       C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetAttribute(
           shared_exec->ordered_nodes[i], CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &cluster));
-      C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetAttribute(
+      // Not every device / driver reports a preferred cluster shape (H200 with
+      // driver 580 rejects the query with CUDA_ERROR_INVALID_VALUE). SAVE then
+      // recorded none either (the query is optional there), so both sides are 0.
+      const CUresult preferred_res = cuGraphKernelNodeGetAttribute(
           shared_exec->ordered_nodes[i], CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION,
-          &preferred));
+          &preferred);
+      if (preferred_res != CUDA_ERROR_INVALID_VALUE)
+        C10_CUDA_DRIVER_CHECK(preferred_res);
       const auto& attrs = update.kernel_attrs;
       TORCH_CHECK(cluster.clusterDim.x == attrs.clusterDimX &&
                       cluster.clusterDim.y == attrs.clusterDimY &&
