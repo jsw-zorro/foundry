@@ -13,31 +13,48 @@ Every model and configuration that passed Foundry SAVE + LOAD with SGLang, with 
 
 sglang upstream main `2c83dc6656` (no Foundry adapter: `FOUNDRY_GRAPH_EXTENSION_CONFIG`) + foundry-core 0.1.0rc3
 (this branch), torch 2.14.1 / cu130, driver 580.159 (CUDA 13.0), `lmsysorg/sglang` dev image, 8xH200 node.
-`tests/sgl/e2e`: native graph, SAVE and LOAD of the same engine; greedy ids of SAVE and LOAD equal to native, SAVE
-`final_alloc_offset` equal to the LOAD offset on every rank, no `[HOOK] ERROR`. Capture is sglang's native decode
-capture, restore is the LOAD restore (max over ranks); TPOT is the median of 32 requests at concurrency 8.
+`tests/sgl/e2e/test_save_load_multigpu.py` runs native graph, SAVE and LOAD of the same engine and sends each the
+same requests: 8 prompts x 64 tokens one at a time, one batch per captured decode size b (b requests per
+attention-DP rank, 12 tokens each) and one prompt per captured prefill bucket. On all three engines every decode
+step of a batch ran a CUDA graph (per-step decode log), so the compared tokens of LOAD come from every restored
+graph. In every row the token ids and the logprob of every output token are identical on native, SAVE and LOAD,
+SAVE `final_alloc_offset` equals the LOAD offset on every rank, and no `[HOOK] ERROR` is logged. The mean token
+logprob is over the native outputs; dummy weights give about -ln(vocabulary size) (-11.93 for Qwen3), so those
+rows compare outputs that carry almost no signal from the weights. Capture is sglang's native decode capture
+(the DeepSeek-V4 row includes its first-use JIT compiles), restore is the LOAD restore (max over ranks), TPOT is
+the median of 32 requests at concurrency 8.
 
-| model | layout | weights | decode graphs per rank | native capture -> restore (s) | TPOT native -> LOAD (ms) |
-|---|---|---|---|---|---|
-| Qwen3-1.7B | 1 GPU | dummy | 4 | 2.3 -> 0.014 | not measured |
-| Qwen3.5-35B-A3B | TP2 | real | 64 | 15.6 -> 0.29 | 10.51 -> 10.09 |
-| Qwen3.5-35B-A3B | EP2, DP attention, DeepEP LL | real | 64 | 15.7 -> 0.40 | 14.88 -> 14.95 |
-| Qwen3.5-35B-A3B | attn TP2 + EP2, DeepEP LL | real | 64 | 17.7 -> 0.84 | 29.19 -> 28.18 |
-| Qwen3-30B-A3B | PP2 | dummy | 64 | 12.0 -> 0.17 | 14.54 -> 14.63 |
-| Qwen3-30B-A3B | TP2 x PP2 (4 GPUs) | dummy | 64 | 7.9 -> 0.15 | 14.17 -> 14.08 |
+| model | layout | weights | graphs per rank (prefill + decode) | outputs compared (tokens) | mean token logprob | native capture -> restore (s) | TPOT native -> LOAD (ms) |
+|---|---|---|---|---|---|---|---|
+| Qwen3.5-35B-A3B | TP2 | real | 0 + 64 | 2088 (25472) | -1.47 | 15.4 -> 0.29 | 10.21 -> 10.35 |
+| Qwen3.5-35B-A3B | EP2, DP attention, DeepEP LL | real | 0 + 64 | 4168 (50432) | -1.47 | 15.6 -> 0.40 | 14.83 -> 14.80 |
+| Qwen3.5-35B-A3B | attn TP2 + EP2, DeepEP LL | real | 0 + 64 | 4168 (50432) | -1.48 | 17.5 -> 0.84 | 28.97 -> 28.51 |
+| Qwen3-30B-A3B | PP2 | dummy | 0 + 64 | 2088 (25472) | -11.93 | 7.4 -> 0.16 | 14.49 -> 14.57 |
+| Qwen3-30B-A3B | TP2 | dummy | 4 + 64 | 2092 (25520) | -11.93 | 12.8 -> 0.28 | 7.84 -> 7.84 |
+| Qwen3-30B-A3B | TP2 x PP2 (4 GPUs) | dummy | 0 + 64 | 2088 (25472) | -11.93 | 8.0 -> 0.15 | 14.39 -> 14.25 |
+| Qwen3.5-122B-A10B-FP8 | EP4, DP attention, DeepEP LL | dummy | 0 + 64 | 8328 (100352) | -11.74 | 42.9 -> 0.53 | 33.84 -> 34.11 |
+| DeepSeek-V4-Flash-FP8 | EP4, DP attention, DeepEP LL | dummy | 0 + 64 | 8328 (100352) | -11.77 | 266.4 -> 0.84 | 19.85 -> 19.89 |
 
-The same 1-GPU test and the TP2 and EP2 rows also pass with `FOUNDRY_ENABLE_EXEC_SHARE=1` on LOAD.
+`tests/sgl/e2e/test_save_load_1gpu.py` (Qwen3-1.7B, dummy weights, 4 decode graphs) passes as well, including the
+LOAD with another `--max-running-requests`, which stops at setup with the difference. With
+`FOUNDRY_ENABLE_EXEC_SHARE=1` on LOAD, the 1-GPU test and the Qwen3.5-35B-A3B EP2 case pass and the TP2 case fails
+(302 of 2088 outputs differ; [`known-issues.md`](known-issues.md)).
+
+This check found that topology groups ignored dependency edges: in an 8-GPU DP-attention + DeepEP case, a member
+rebuilt on its template ran with a programmatic edge it did not have, and one of 16648 compared outputs differed
+in its logprobs on LOAD. Since the fix, the topology key includes the edges.
 
 The recipe scripts as shipped (plugin route chosen by `persist.sh`), each run natively, with `--save` and with
-`--load`; greedy output of 3 prompts x 24 tokens identical to native in every case. `/health` is measured from the
-script start; two engines ran at the same time on the host, so the times include that contention.
+`--load`: 3 prompts x 24 tokens one at a time and one batch of 8 token-id prompts x 48 tokens, identical to native
+in every case, the batch decoded on CUDA graphs on all three. `/health` is measured from the script start; the four
+scripts ran at the same time on the host, so the times include that contention.
 
 | script | GPUs | weights | decode graphs restored per rank | restore (s) | `/health` native -> LOAD (s) |
 |---|---|---|---|---|---|
-| `serve_qwen3-mini.sh` | 1 | real | 52 | 0.11 | 63 -> 55 |
-| `serve_qwen3-1.7b_dp.sh 2` | 2 | real | 256 | 0.56 | 83 -> 71 |
-| `serve_qwen3-1.7b_tp.sh 2` | 2 | real | 256 | 0.81 | 77 -> 61 |
-| `serve_qwen3.5-35ba3b.sh tp2` | 2 | real | 256 | 1.10 | 135 -> 71 |
+| `serve_qwen3-mini.sh` | 1 | real | 52 | 0.11 | 59 -> 47 |
+| `serve_qwen3-1.7b_dp.sh 2` | 2 | real | 256 | 0.56 | 81 -> 63 |
+| `serve_qwen3-1.7b_tp.sh 2` | 2 | real | 256 | 0.92 | 75 -> 51 |
+| `serve_qwen3.5-35ba3b.sh tp2` | 2 | real | 256 | 1.10 | 133 -> 63 |
 
 ## Dependency route, torch 2.14.1, 4xH200 (2026-10-11)
 
