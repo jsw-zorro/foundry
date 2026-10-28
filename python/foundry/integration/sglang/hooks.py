@@ -76,6 +76,7 @@ def install(cfg_path: str | None) -> None:
     _patch_alloc_memory_pool()
     _patch_cuda_graph_capture()
     _patch_spawn_sites()
+    _patch_weight_update_group()
 
     _INSTALLED = True
     logger.info("[Foundry] SGLang hooks installed")
@@ -395,6 +396,10 @@ def _preallocate_once() -> None:
 
 # The capture scope being run: (phase, prefill request-slot count or None).
 _scope: tuple[str, int | None] | None = None
+# Phases whose startup capture scope (SAVE: capture and archive; LOAD: restore)
+# completed. A later capture of the same phase is a recapture (see capture_scope).
+_startup_captured: set[str] = set()
+_recapturing = False
 
 
 def capture_one(shape_key, forward_fn, *, pool, stream):
@@ -408,6 +413,16 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
         raise RuntimeError("[Foundry] capture_one called without SAVE or LOAD")
     if _scope is None:
         raise RuntimeError("[Foundry] capture_one called outside capture_scope")
+    if _recapturing:
+        # A recapture after startup: a plain capture, neither archived nor
+        # restored (no warm-up forwards: everything they would initialize
+        # lazily already ran while serving).
+        from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
+
+        from foundry.integration.sglang.graph_ops import capture_graph
+
+        with graph_pool_capture_scope():
+            return capture_graph(pool, stream, forward_fn)
     req_slots = _scope[1]
     if getattr(shape_key, "attention_variant", None) is not None:
         # ShapeKey.attention_variant (e.g. DSV4.1 candidate-indexer graphs on
@@ -559,6 +574,7 @@ def _decode_capture_scope(model):
         # graph memory at the driver level with no pool bookkeeping).
         torch.cuda.empty_cache()
         rt.log_alloc_offset("after_post_load_empty_cache")
+        rt.close_allocation_region()
         return
 
     # SAVE: the same upstream loop; capture_one captures and saves each graph.
@@ -574,14 +590,40 @@ def _decode_capture_scope(model):
     save_graph_manifest()
     pack_fatbins()
     rt.record_region_layout()
+    rt.close_allocation_region()
 
 
 @contextlib.contextmanager
 def capture_scope(phase: str, model, req_slots: int | None = None):
     """Prefill or decode capture scope (both routes): ``phase`` is
     ``"prefill"`` (with the runner's ``req_slots``, which every
-    :func:`capture_one` inside uses) or ``"decode"``."""
-    global _scope
+    :func:`capture_one` inside uses) or ``"decode"``.
+
+    Only the first scope of a phase uses the archive. SGLang recaptures after
+    startup in some flows (``update_weights_from_disk`` with
+    ``recapture_cuda_graph=True``, a PD role switch); the archive holds the
+    startup graphs only, and a second restore would replay SAVE's allocation
+    sequence at a cursor that has moved on (the hook aborts the process). A
+    recapture therefore captures each shape in place, as sglang would, and
+    leaves the archive alone."""
+    global _scope, _recapturing
+    if phase in _startup_captured:
+        logger.warning(
+            "[Foundry] SGLang %s CUDA graphs recaptured after startup (e.g. "
+            "update_weights_from_disk with recapture_cuda_graph=True): captured in place, "
+            "the archive keeps the startup graphs",
+            phase,
+        )
+        if _scope is not None:
+            raise RuntimeError(f"[Foundry] capture_scope({phase!r}) inside capture_scope{_scope}")
+        _scope = (phase, req_slots if phase == "prefill" else None)
+        _recapturing = True
+        try:
+            yield
+        finally:
+            _scope = None
+            _recapturing = False
+        return
     if phase == "prefill":
         if req_slots is None:
             raise ValueError("[Foundry] capture_scope('prefill') needs req_slots")
@@ -597,6 +639,7 @@ def capture_scope(phase: str, model, req_slots: int | None = None):
     try:
         with inner:
             yield
+        _startup_captured.add(phase)
     finally:
         _scope = None
 
@@ -690,6 +733,46 @@ def _patch_alloc_memory_pool() -> None:
         return result
 
     cls.alloc_memory_pool = patched_alloc
+
+
+# NCCL settings the plugin pins in the engine (plugin.ENV_PINS) that the peer
+# of a weight-update group must share: user-buffer registration on one side
+# only hangs the group's first broadcast (measured with NCCL 2.30.7, P2P/IPC).
+_WEIGHT_UPDATE_NCCL_ENV = (
+    "NCCL_LOCAL_REGISTER",
+    "NCCL_GRAPH_REGISTER",
+    "NCCL_CUMEM_ENABLE",
+    "NCCL_NVLS_ENABLE",
+)
+
+
+def _patch_weight_update_group() -> None:
+    """Plugin route: ``WeightUpdater.init_weights_update_group`` (an RL
+    trainer joins the engine to push weights) logs the NCCL settings the
+    trainer's side of the group must use."""
+    try:
+        from sglang.srt.model_executor.model_runner_components import weight_updater
+    except ImportError:
+        return
+    cls = getattr(weight_updater, "WeightUpdater", None)
+    orig = getattr(cls, "init_weights_update_group", None)
+    if orig is None:
+        return
+
+    @functools.wraps(orig)
+    def patched(self, *args, **kwargs):
+        if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
+            env = os.environ
+            settings = " ".join(f"{k}={env.get(k, 'unset')}" for k in _WEIGHT_UPDATE_NCCL_ENV)
+            logger.warning(
+                "[Foundry] weight-update group: this engine's NCCL runs with %s (Foundry pins); "
+                "the trainer must create its side of the group with the same values, or the first "
+                "broadcast hangs",
+                settings,
+            )
+        return orig(self, *args, **kwargs)
+
+    cls.init_weights_update_group = patched
 
 
 def _patch_cuda_graph_capture() -> None:

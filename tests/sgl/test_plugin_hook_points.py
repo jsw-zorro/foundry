@@ -57,6 +57,21 @@ _HOOK_POINTS = [
         ["self"],
     ),
     (
+        # Logs the NCCL settings an RL trainer must share (the wrapper passes
+        # every argument through).
+        "sglang.srt.model_executor.model_runner_components.weight_updater",
+        "WeightUpdater.init_weights_update_group",
+        [
+            "self",
+            "master_address",
+            "master_port",
+            "rank_offset",
+            "world_size",
+            "group_name",
+            "backend",
+        ],
+    ),
+    (
         "sglang.srt.model_executor.runner.decode_cuda_graph_runner",
         "DecodeCudaGraphRunner._resolve_shared_read_ends",
         ["self", "attn_backend", "forward_mode"],

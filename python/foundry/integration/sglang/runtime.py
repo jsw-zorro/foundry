@@ -407,6 +407,33 @@ def skip_to_scratch_boundary() -> None:
     logger.info("[Foundry] SGLang skipped allocator to scratch boundary %d", boundary)
 
 
+_region_closed = False
+
+
+def close_allocation_region() -> None:
+    """End of startup (after the last startup capture or restore): this
+    thread's later allocations go to the driver as usual.
+
+    Nothing allocated after this point is addressed by a captured or restored
+    graph. The region hands out address range bump-style and never reuses a
+    freed range, so allocations made while serving (the receive buffers of
+    every weight update, which torch releases at each empty_cache and requests
+    again) would walk the cursor to the end of the region, and region memory
+    is VMM memory, which a process without Foundry's hook cannot open over
+    CUDA IPC."""
+    global _region_closed
+    cfg = get_config()
+    if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE or _region_closed:
+        return
+    cge.stop_allocation_region()
+    _region_closed = True
+    logger.info(
+        "[Foundry] SGLang allocation region closed after startup at offset %d: later "
+        "allocations are plain",
+        cge.get_current_alloc_offset(),
+    )
+
+
 @contextlib.contextmanager
 def allocation_region_suspended():
     """Run a block whose device allocations must not touch the deterministic
@@ -420,7 +447,8 @@ def allocation_region_suspended():
         gc.collect()
         torch.cuda.empty_cache()
     finally:
-        cge.resume_allocation_region()
+        if not _region_closed:
+            cge.resume_allocation_region()
 
 
 def mark_layout_start() -> None:

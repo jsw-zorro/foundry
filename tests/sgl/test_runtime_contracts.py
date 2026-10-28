@@ -195,3 +195,29 @@ def test_archive_fingerprint_reads_the_full_server_args(monkeypatch):
     full = types.SimpleNamespace(max_running_requests=8)
     monkeypatch.setattr(context, "get_server_args", lambda: full)
     assert rt._full_server_args(types.SimpleNamespace(tp_size=1)) is full
+
+
+def test_recapture_after_startup_captures_in_place(monkeypatch):
+    """A capture scope of a phase whose startup scope already ran (sglang
+    recaptures after update_weights_from_disk(recapture_cuda_graph=True))
+    neither restores nor archives: capture_one captures the shape in place."""
+    import contextlib
+
+    import sglang.srt.model_executor.runner_utils.pool as pool
+    from foundry.integration.sglang import graph_ops, hooks
+    from foundry.integration.sglang.config import CUDAGraphExtensionMode
+
+    captured = []
+    monkeypatch.setattr(hooks, "get_graph_extension_mode", lambda: CUDAGraphExtensionMode.LOAD)
+    monkeypatch.setattr(hooks, "_startup_captured", {"decode"})
+    monkeypatch.setattr(pool, "graph_pool_capture_scope", contextlib.nullcontext)
+    monkeypatch.setattr(
+        graph_ops, "capture_graph", lambda p, s, fn: captured.append((p, s)) or ("graph", fn())
+    )
+    monkeypatch.setattr(
+        graph_ops, "restore_next_decode_graph", lambda key: pytest.fail("restored on a recapture")
+    )
+    with hooks.capture_scope("decode", None):
+        assert hooks.capture_one("key", lambda: "out", pool="p", stream="s") == ("graph", "out")
+    assert captured == [("p", "s")]
+    assert hooks._scope is None and not hooks._recapturing
