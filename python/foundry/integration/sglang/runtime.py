@@ -321,6 +321,12 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
             json.dump(archive_fingerprint(server_args), f, indent=1)
     t_bin = 0.0
     if cfg.mode == CUDAGraphExtensionMode.LOAD:
+        if os.environ.get("FOUNDRY_ENABLE_EXEC_SHARE") == "1":
+            logger.warning(
+                "[Foundry] FOUNDRY_ENABLE_EXEC_SHARE=1: exec share mode gave tokens that differ "
+                "from native on a tested model (docs/sglang/known-issues.md); serve with the "
+                "default mode"
+            )
         cge.set_skip_fatbin_processing(True)
         if not workspace_dir.exists():
             raise RuntimeError(f"Foundry workspace for rank {rank} does not exist: {workspace_dir}")

@@ -1,5 +1,16 @@
 # Known issues — SGLang integration
 
+## Exec share mode: tokens differ from native on one tested model (OPEN, 2026-10-28)
+
+With `FOUNDRY_ENABLE_EXEC_SHARE=1` on LOAD, `tests/sgl/e2e/test_save_load_multigpu.py` fails for Qwen3.5-35B-A3B TP2
+(real weights, upstream main `2c83dc6656`, 2xH200): 302 of the 2088 compared outputs differ from native, in 50 of the
+64 decode batch sizes, by up to 6.3 in logprob. Most differences start at the first output token, which the eager
+prefill computes, so a replay of a switched member wrote memory that a later prefill reads; one replay computing a
+wrong value would not do that. The default eager mode passes the same case, and share mode passes the Qwen3.5-35B-A3B
+EP2 (DP attention) case and the 1-GPU test. Cause not determined. Serve with the default eager mode until this is
+fixed; LOAD logs a warning when share mode is enabled. The earlier share-mode runs compared only batch-size-1 outputs,
+which no member graph produces.
+
 ## Archives from before capture_loop_version 2 (RULE, 2026-09-30)
 
 SAVE and LOAD now both run sglang's own decode capture loop and substitute only `FullCudaGraphBackend.capture_one`;

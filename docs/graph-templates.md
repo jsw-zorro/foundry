@@ -100,7 +100,8 @@ rewrites the builder graph's parameters, `cuGraphExecUpdate`s the template's
 exec and uploads it (host only, no synchronization); a replay of the same
 member launches directly. Memory is one exec per template. An updated exec
 replays slower unless the driver's update path is repaired
-([`exec-update-penalty.md`](exec-update-penalty.md), section 3).
+([`exec-update-penalty.md`](exec-update-penalty.md), section 3). On one tested SGLang model share mode gives tokens
+that differ from native ([`sglang/known-issues.md`](sglang/known-issues.md)); serve with eager mode.
 
 ### Exec-pool prewarm: cost
 
