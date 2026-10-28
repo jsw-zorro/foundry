@@ -40,10 +40,11 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-# Upstream sglang main commit the plugin was validated on (fork branch
-# ``foundry-plugin``). An older tree that has the plugin framework and the
-# three resolution steps (e.g. the fork base) is accepted with a warning.
-VALIDATED_SGLANG_COMMIT = "fa090f7755"
+# Upstream sglang main commit the plugin was last validated on (earlier:
+# fa090f7755, fork branch ``foundry-plugin``). An older tree that has the
+# plugin framework and the three resolution steps (e.g. the fork base) is
+# accepted with a warning.
+VALIDATED_SGLANG_COMMIT = "2c83dc6656"
 ENTRY_POINT_GROUP = "sglang.srt.plugins"
 ENTRY_POINT_NAME = "foundry"
 ENTRY_POINT_VALUE = "foundry_sglang_plugin:load"

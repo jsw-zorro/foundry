@@ -9,11 +9,14 @@ before the server args are built, and at the top of every scheduler process.
 Each run of :func:`activate` registers the resolution hooks below and installs
 the runtime patches (``hooks.install``).
 
-The data-parallel controller process does not call ``load_plugins()``. It
-needs nothing from Foundry: the only patch it used to receive (LD_PRELOAD for
-the scheduler spawn) is covered by the environment it inherits from the
-launcher, whose ``Engine._launch_scheduler_processes`` sets it before the
-controller is spawned.
+Since upstream #35594 the data-parallel controller and the detokenizer call
+``load_plugins()`` too, so the plugin activates there as well. Neither needs
+it: the controller's spawn environment (LD_PRELOAD, the pins) is the one it
+inherits from the launcher, whose ``Engine._launch_scheduler_processes`` sets
+it before the controller is spawned, and its patched
+``launch_tensor_parallel_group`` sets the same values again. Activation in a
+process that never runs the model costs ~0.7 s of imports (H200 host, in
+parallel with the schedulers' start) and initializes nothing on the GPU.
 
 Resolution hooks (``register_resolution_hook`` on whitelisted steps, so the
 pins land at the same pipeline positions as the former in-tree step):
@@ -319,10 +322,11 @@ def reject_unsupported_features(server_args: Any) -> None:
 @dataclass(frozen=True)
 class FieldPin:
     """A ServerArgs field the plugin declares to ``value``. ``default`` is
-    sglang's default (fa090f7755): a raw value other than the pin and the
-    default can only come from the user, and raises. ``strict`` pins are
-    re-checked after the later resolution steps; a non-strict one may be
-    turned off by sglang (the fallback is still replayable)."""
+    sglang's default (fa090f7755, unchanged at 2c83dc6656): a raw value other
+    than the pin and the default can only come from the user, and raises.
+    ``strict`` pins are re-checked after the later resolution steps; a
+    non-strict one may be turned off by sglang (the fallback is still
+    replayable)."""
 
     field: str
     value: Any

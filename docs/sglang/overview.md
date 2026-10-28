@@ -2,7 +2,7 @@
 
 Foundry persists SGLang's decode (and optionally prefill) CUDA graphs to disk on SAVE and restores them on LOAD, skipping graph capture, kernel warmup, and the per-batch-size attention metadata setup costs.
 
-Foundry runs as an **SGLang plugin**: installing the `foundry-core` package registers the entry point `foundry = "foundry_sglang_plugin:load"` in group `sglang.srt.plugins`, and `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>` in the launcher's environment switches it on. No SGLang change is needed (validated on upstream main `fa090f7755`, fork branch `foundry-plugin`). The plugin wraps three whitelisted resolution steps to pin the graph settings and installs the runtime patches in [`hooks.md`](hooks.md) in the launcher and in every scheduler process.
+Foundry runs as an **SGLang plugin**: installing the `foundry-core` package registers the entry point `foundry = "foundry_sglang_plugin:load"` in group `sglang.srt.plugins`, and `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>` in the launcher's environment switches it on. No SGLang change is needed (validated on upstream main `fa090f7755`, fork branch `foundry-plugin`, and on upstream main `2c83dc6656`, 2026-10-28). The plugin wraps three whitelisted resolution steps to pin the graph settings and installs the runtime patches in [`hooks.md`](hooks.md) in the launcher and in every scheduler process.
 
 **Dependency route.** An SGLang that declares Foundry as an optional dependency (`sglang[foundry]`, fork branch
 `foundry-dep`) calls `foundry.integration.sglang.api` from its own call sites instead of being patched:
