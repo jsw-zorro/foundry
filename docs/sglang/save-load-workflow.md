@@ -51,7 +51,7 @@ One shared `recipe/sglang/foundry.toml` for SAVE and LOAD (the mode comes from
 base_addr = 0x600000000000
 region_size = "256GB"
 workspace_root = "foundry_archive"
-scratch_space_size = "1024MB"
+scratch_space_size = "8GB"
 ```
 
 See [`memory-lifecycle.md`](memory-lifecycle.md) for the field semantics.
@@ -127,7 +127,7 @@ SAVE (success):
 Foundry SGLang integration activated from .../save_qwen_1.7b.toml
 [Foundry] SGLang rank=0 workspace_dir=foundry_archive_qwen_1.7b/rank_0
 [Foundry] SGLang graph extension setup completed in 0.x s
-[Foundry] SGLang skipped allocator to scratch boundary 1073741824
+[Foundry] SGLang skipped allocator to scratch boundary 8589934592
 [Foundry] SGLang reused saved memory pool config       ← only on LOAD
 [Foundry] SGLang kernel_warmup skipped in save mode
 …

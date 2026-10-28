@@ -121,7 +121,7 @@ Install it into the venv that runs `sglang serve`. On the dependency route the s
 base_addr = 0x600000000000
 region_size = "256GB"
 workspace_root = "foundry_archive"
-scratch_space_size = "1024MB"
+scratch_space_size = "8GB"
 ```
 
 See [`memory-lifecycle.md`](memory-lifecycle.md) for what each field controls.

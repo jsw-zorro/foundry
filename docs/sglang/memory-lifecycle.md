@@ -56,7 +56,7 @@ flowchart TD
 
 ### Bucket A — pre-deterministic scratch
 
-CUDA context, cuBLAS handle, NCCL warmup, distributed bring-up. These run **inside** the VMM region but are released by `skip_to_scratch_boundary` — the cursor is forced to `cfg.scratch_space_size` regardless of what landed below it. Any non-determinism in this region is invisible to the rest of the lifecycle.
+CUDA context, cuBLAS handle, NCCL warmup, distributed bring-up. These run **inside** the VMM region but are released by `skip_to_scratch_boundary` — the cursor is forced to `cfg.scratch_space_size` regardless of what landed below it. Any non-determinism in this region is invisible to the rest of the lifecycle, as long as it stays below the boundary SAVE recorded (LOAD raises otherwise).
 
 ### Bucket B — deterministic runtime state
 
@@ -110,13 +110,13 @@ Persisting the resolved `MemoryPoolConfig` (via `dataclasses.asdict`) and re-app
 - `torch._C._cuda_getCurrentBlasHandle()` — eager cuBLAS handle so the workspace it wants lands in scratch instead of post-scratch territory
 - creates the `CUDAGraphExtensionState` singleton
 
-After upstream `init_torch_distributed` returns, `skip_to_scratch_boundary` forces the cursor to `cfg.scratch_space_size` (default 1 GiB). Allocations below that line are scratch and don't need to be deterministic.
+After upstream `init_torch_distributed` returns, `skip_to_scratch_boundary` forces the cursor to `cfg.scratch_space_size` (the recipes use 8 GB; it costs address range only). Allocations below that line are scratch and don't need to be deterministic. When distributed init allocated past it (4.9 GB on 8 GPUs with DeepEP), SAVE keeps the cursor as the boundary and logs a warning. SAVE records the boundary as `scratch_end_offset` in `region_layout.json`; LOAD moves to the recorded boundary and raises if its own distributed init allocated past it, since every later buffer would sit above the offsets the restored graphs address.
 
 ## Region layout
 
 Two SAVE-side calls describe the deterministic range for LOAD:
 
-- `mark_layout_start` runs on both modes at the sequence point where LOAD preallocates (after the pre-capture bootstraps: logits gatherer, DeepEP buffer, and SAVE's runtime inits). It returns torch's cached-but-free blocks to the driver on both sides, so the caching allocator is in the same state when the layout begins, and on SAVE records the cursor as `start_offset`. LOAD's cursor equals `start_offset` by construction (no eager forward runs on either mode); a difference is logged as a warning.
-- `record_region_layout` runs after the capture loop completes (after `save_graph_manifest` and `pack_fatbins`). It writes `rank_{N}/region_layout.json` with `start_offset`, the `final_alloc_offset` watermark and `live_ranges` — the `(offset, size)` ranges still mapped at that point (`cge.get_live_region_ranges`). `final_alloc_offset` is also mirrored into the shared `warmup_state.json`.
+- `mark_layout_start` runs on both modes at the sequence point where LOAD preallocates (after the pre-capture bootstraps: logits gatherer, DeepEP buffer, and SAVE's runtime inits). It returns torch's cached-but-free blocks to the driver on both sides, so the caching allocator is in the same state when the layout begins, and on SAVE records the cursor as `start_offset`. LOAD's cursor equals `start_offset` by construction (no eager forward runs on either mode). A LOAD cursor below it is moved up and logged as a warning; one above it is an error, because LOAD's own buffers then occupy offsets the restored graphs use.
+- `record_region_layout` runs after the capture loop completes (after `save_graph_manifest` and `pack_fatbins`). It writes `rank_{N}/region_layout.json` with `scratch_end_offset`, `start_offset`, the `final_alloc_offset` watermark and `live_ranges` — the `(offset, size)` ranges still mapped at that point (`cge.get_live_region_ranges`). `final_alloc_offset` is also mirrored into the shared `warmup_state.json`.
 
 `preallocate_for_load_mode` reads the layout. It calls `cge.preallocate_ranges(live_ranges, final_alloc_offset)` from LOAD's current cursor, which maps only the live ranges — one physical handle per coalesced segment — so memory SAVE allocated and freed inside the span costs LOAD nothing, then checks the cursor against `start_offset` (equal by construction; a difference is logged, and the cursor is moved up when LOAD is behind). The cursor is **not** advanced by the preallocation itself; allocations that land in the span are pointer bumps (no driver calls). An allocation that lands in an unbacked hole of the span is backed on demand by the hook and logged (`mapped N MB on demand`), which means the SAVE and LOAD sequences diverged there.

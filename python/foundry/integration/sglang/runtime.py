@@ -77,6 +77,9 @@ _LAYOUT_FILE = "region_layout.json"
 CAPTURE_LOOP_VERSION = 2
 _layout_start_offset: int | None = None
 _final_alloc_offset: int = 0
+# Where weight loading starts: the scratch boundary, or (SAVE) the cursor when
+# distributed init allocated past it. Recorded in _LAYOUT_FILE; LOAD moves to it.
+_scratch_end_offset: int | None = None
 
 
 def get_state() -> CUDAGraphExtensionState | None:
@@ -215,21 +218,59 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     )
 
 
+def _saved_scratch_end(workspace_dir: str) -> int | None:
+    """LOAD: SAVE's scratch boundary from the archive (None: an archive written
+    before it was recorded)."""
+    path = os.path.join(workspace_dir, _LAYOUT_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        value = json.load(f).get("scratch_end_offset")
+    return None if value is None else int(value)
+
+
 def skip_to_scratch_boundary() -> None:
+    """End of distributed init: move the cursor to the scratch boundary, so the
+    weights start at the same offset on SAVE and LOAD however much distributed
+    init allocated below it (NCCL, symmetric memory and DeepEP buffers depend on
+    the host and the library versions).
+
+    SAVE uses ``scratch_space_size``, or the cursor when distributed init
+    allocated past it (with a warning: no margin is left), and records the
+    boundary in the archive. LOAD moves to SAVE's boundary, and stops when its
+    own distributed init allocated past it: every later buffer would sit above
+    the offsets the restored graphs address."""
+    global _scratch_end_offset
     cfg = get_config()
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return
     scratch = parse_size(cfg.scratch_space_size)
     current = cge.get_current_alloc_offset()
-    if current > scratch:
+    boundary = scratch
+    if cfg.mode == CUDAGraphExtensionMode.LOAD and cfg.workspace_dir is not None:
+        saved = _saved_scratch_end(cfg.workspace_dir)
+        if saved is None and current > scratch:
+            # Archive without the record: SAVE kept its cursor; so does LOAD.
+            saved = current
+        boundary = scratch if saved is None else saved
+        if current > boundary:
+            raise RuntimeError(
+                f"Foundry LOAD: distributed init allocated {current / 2**20:.0f} MB before the "
+                f"weights, past SAVE's scratch boundary at {boundary / 2**20:.0f} MB. Set "
+                f"scratch_space_size above {current / 2**20:.0f} MB and re-SAVE."
+            )
+    elif current > scratch:
         logger.warning(
-            "[Foundry] Current allocation offset %d exceeds scratch size %d",
-            current,
-            scratch,
+            "[Foundry] SGLang distributed init allocated %.0f MB, more than scratch_space_size "
+            "(%.0f MB): the weights start right after it, and a LOAD whose distributed init "
+            "allocates more will refuse the archive. Raise scratch_space_size above it.",
+            current / 2**20,
+            scratch / 2**20,
         )
-        return
-    cge.set_current_alloc_offset(scratch)
-    logger.info("[Foundry] SGLang skipped allocator to scratch boundary %d", scratch)
+        boundary = current
+    _scratch_end_offset = boundary
+    cge.set_current_alloc_offset(boundary)
+    logger.info("[Foundry] SGLang skipped allocator to scratch boundary %d", boundary)
 
 
 @contextlib.contextmanager
@@ -258,8 +299,9 @@ def mark_layout_start() -> None:
     after this point is either replayed at recorded absolute offsets (graph
     memory) or allocated at the same offset on both sides (the FlashInfer
     metadata pre-pass); the pre-capture bootstraps run before it on both modes,
-    so LOAD's cursor equals the recorded start (a difference is a divergence
-    and is logged as a warning by preallocate_for_load_mode)."""
+    so LOAD's cursor equals the recorded start (a difference is a divergence:
+    preallocate_for_load_mode moves a LOAD that is behind up to it and stops
+    one that is ahead)."""
     global _layout_start_offset
     cfg = get_config()
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
@@ -288,6 +330,7 @@ def record_region_layout() -> int:
     if cfg.workspace_dir is not None:
         ranges = cge.get_live_region_ranges()
         layout = {
+            "scratch_end_offset": _scratch_end_offset,
             "start_offset": _layout_start_offset,
             "final_alloc_offset": _final_alloc_offset,
             "live_ranges": ranges,
@@ -349,10 +392,10 @@ def preallocate_for_load_mode() -> None:
     Maps, in one step, every range that was live at the end of SAVE between
     LOAD's current cursor and the watermark, then checks the cursor against
     SAVE's recorded layout start (equal by construction; a difference means
-    the allocation sequences diverged and is logged, moving the cursor up when
-    LOAD is behind). Allocations inside the span are pointer bumps; a hole is
-    backed on demand by the hook and logged, since it too means the sequences
-    diverged."""
+    the allocation sequences diverged: a LOAD that is behind is moved up and
+    logged, one that is ahead is an error). Allocations inside the span are
+    pointer bumps; a hole is backed on demand by the hook and logged, since it
+    too means the sequences diverged."""
     cfg = get_config()
     if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
         return
@@ -397,15 +440,21 @@ def preallocate_for_load_mode() -> None:
         return
     # The two cursors coincide by construction; a difference means the SAVE and
     # LOAD allocation sequences diverged before the layout start. Moving up
-    # keeps later allocations at SAVE's offsets; being ahead cannot be repaired.
-    if current < start:
-        cge.set_current_alloc_offset(start)
+    # keeps later allocations at SAVE's offsets; being ahead cannot be repaired:
+    # LOAD's own buffers then occupy offsets the restored graphs use.
+    if current > start:
+        raise RuntimeError(
+            f"Foundry LOAD: the cursor before the graph restore is {current}, past SAVE's layout "
+            f"start {start} ({(current - start) / 2**20:.0f} MB): LOAD allocated more than SAVE "
+            "before the graphs (compare the 'alloc_offset[...]' lines of both logs for the first "
+            "difference). Serve with the settings and environment of the SAVE run, or re-SAVE."
+        )
+    cge.set_current_alloc_offset(start)
     logger.warning(
-        "[Foundry] SGLang LOAD cursor %d != SAVE's layout start %d (%s): the allocation "
-        "sequences differ before the graph restore",
+        "[Foundry] SGLang LOAD cursor %d != SAVE's layout start %d (moved up to it): the "
+        "allocation sequences differ before the graph restore",
         current,
         start,
-        "moved up to it" if current < start else "ahead of it, not moved",
     )
 
 
