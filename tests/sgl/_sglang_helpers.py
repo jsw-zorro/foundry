@@ -129,7 +129,14 @@ def serve(
 ):
     """Launch a native (``mode=None``) or Foundry engine, POST each prompt to
     /generate, call ``while_up()`` while it still runs, stop it. Returns (the
-    /generate responses, ``while_up``'s result, the engine log)."""
+    /generate responses, ``while_up``'s result, the engine log).
+
+    A prompt is the text, or a /generate body (e.g. ``{"text": ..., "image_data":
+    [...]}``, or a batch ``{"input_ids": [[...], ...]}``, whose response is a
+    list); ``sampling`` applies unless the body has its own ``sampling_params``.
+    Request ``i`` is bracketed in the engine's stderr log by ``[e2e] request i
+    begin`` / ``end`` lines (:func:`request_log` returns what the engine logged
+    in between)."""
     import requests
     from sglang.test.test_utils import (
         DEFAULT_URL_FOR_TEST,
@@ -150,17 +157,35 @@ def serve(
         )
         try:
             responses = []
-            for prompt in prompts:
+            for i, prompt in enumerate(prompts):
+                body = dict(prompt) if isinstance(prompt, dict) else {"text": prompt}
+                body.setdefault("sampling_params", sampling)
+                _mark(err, f"request {i} begin")
                 r = requests.post(
-                    DEFAULT_URL_FOR_TEST + "/generate",
-                    json={"text": prompt, "sampling_params": sampling},
-                    timeout=request_timeout,
+                    DEFAULT_URL_FOR_TEST + "/generate", json=body, timeout=request_timeout
                 )
                 r.raise_for_status()
                 responses.append(r.json())
+                _mark(err, f"request {i} end")
             if while_up is not None:
                 extra = while_up()
         finally:
             terminate_and_kill_process_tree(process)
     log = (tmp_path / f"{name}.err").read_text() + (tmp_path / f"{name}.out").read_text()
     return responses, extra, log
+
+
+def _mark(err, text):
+    # The engine's processes write to the same open file (shared offset), so
+    # the line lands after everything the engine has logged so far (on a line
+    # of its own, should the engine be in the middle of one).
+    err.write(f"\n[e2e] {text}\n")
+    err.flush()
+
+
+def request_log(log, i):
+    """The engine log lines written while :func:`serve` request ``i`` ran."""
+    m = re.search(rf"^\[e2e\] request {i} begin\n(.*?)^\[e2e\] request {i} end$", log, re.M | re.S)
+    if m is None:
+        raise AssertionError(f"request {i} markers not found in the engine log")
+    return m.group(1)
