@@ -13,7 +13,9 @@ serve settings of the recipes in recipe/sglang/. Assertions:
 
 Cases (args copied from the recipe lines cited in CASES; a recipe change must show up here):
   q35_tp2 / q35_ep2 / q35_tpep2   Qwen3.5-35B-A3B on 2 GPUs (serve_qwen3.5-35ba3b.sh), real weights
+  q3_30b_pp2                      Qwen3-30B-A3B, 2 pipeline stages, dummy weights (stage 0 returns PPProxyTensors)
   q35_122b_fp8_ep4                Qwen3.5-122B-A10B-FP8 ep4 (serve_qwen3.5-122ba10b.sh), xlarge, dummy weights
+  q3_30b_tp2pp2                   Qwen3-30B-A3B, 2 pipeline stages x TP2, xlarge, dummy weights
   dsv4_flash_fp8_ep4              DeepSeek-V4-Flash-FP8 ep4 (serve_deepseek-v4-flash.sh), xlarge, dummy weights
 Native, SAVE and LOAD all run with the variables of recipe/sglang/set_env.sh (a value
 already exported wins, as there), plus NCCL_CUMEM_ENABLE=0 and NCCL_NVLS_ENABLE=0.
@@ -148,6 +150,12 @@ CASES = [
           ["--tp-size", "2", "--ep-size", "2"] + _DEEPEP
           + ["--chunked-prefill-size", "256", "--attention-backend", "fa3", "--max-running-requests", "512"],
           _decode_step(2, MAXBS), memfrac=0.8, weights="real", env=_EP_ENV),
+    # Pipeline parallel: the decode graphs of a non-last stage return PPProxyTensors, which the
+    # archive records (decode_graphs.json) and LOAD rebuilds.
+    _case("q3_30b_pp2", "Qwen/Qwen3-30B-A3B", 2, ["--pp-size", "2"], _decode_max(MAXBS),
+          memfrac=0.8, weights="dummy"),
+    _case("q3_30b_tp2pp2", "Qwen/Qwen3-30B-A3B", 4, ["--tp-size", "2", "--pp-size", "2"],
+          _decode_max(MAXBS), memfrac=0.8, weights="dummy", marks=pytest.mark.xlarge),
     # serve_qwen3.5-122ba10b.sh ep4 (common args :49-53): model :8, mamba :17 / :51,
     # GRAPHS :18-19, TOPO :22-24, env :39, MEMFRAC :43.
     _case("q35_122b_fp8_ep4", "Qwen/Qwen3.5-122B-A10B-FP8", 4,

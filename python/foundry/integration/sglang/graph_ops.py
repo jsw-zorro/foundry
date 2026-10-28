@@ -38,6 +38,11 @@ _PREFILL_GRAPH_FILENAME_RE = re.compile(
 # Per-rank SAVE record of what LOAD needs besides the graphs: the DP-gather
 # flag the captured forwards latch and the prefill output structures.
 _PREFILL_STATE_FILE = "prefill_graphs.json"
+# Per rank: the output structure of each decode graph whose output is not the
+# logits (a non-last pipeline stage returns PPProxyTensors). Absent when every
+# decode graph returns the logits, as in archives saved before it existed.
+_DECODE_STATE_FILE = "decode_graphs.json"
+_decode_output_specs: dict[str, Any] = {}
 # PrefillCudaGraphRunner's only ShapeKey variants (_chunked_prefix_variant).
 _CHUNKED_PREFIX_LABEL = "chunked_prefix:"
 # SAVE: output structure of each prefill graph whose output is not one tensor.
@@ -139,28 +144,45 @@ def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
     return out
 
 
-def _pack_output(output: Any) -> torch.Tensor:
+def _pack_output(output: Any) -> tuple[Any, Any]:
+    """(tensors to save, structure spec) of a decode graph's output: the
+    logits (spec None), or the PPProxyTensors of a non-last pipeline stage
+    (spec ``{"pp": names}``, its tensors in that order)."""
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
     if isinstance(output, LogitsProcessorOutput):
         if output.next_token_logits is None:
             raise TypeError("SGLang decode CUDA graph output has no next_token_logits")
-        return output.next_token_logits
+        return output.next_token_logits, None
 
     if isinstance(output, torch.Tensor):
-        return output
+        return output, None
+
+    if isinstance(output, PPProxyTensors):
+        names = list(output.tensors)
+        return [output.tensors[n] for n in names], {"pp": names}
 
     raise TypeError(f"Unsupported SGLang CUDA graph output type: {type(output)!r}")
 
 
-def _unpack_output(tensors: Any) -> Any:
+def _unpack_output(tensors: Any, spec: Any = None) -> Any:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
-    if isinstance(tensors, (tuple, list)):
-        if len(tensors) != 1:
-            raise RuntimeError(f"Expected one SGLang CUDA graph output tensor, got {len(tensors)}")
-        tensors = tensors[0]
-    return LogitsProcessorOutput(next_token_logits=tensors)
+    if isinstance(tensors, torch.Tensor):
+        tensors = [tensors]
+    if spec is not None:
+        names = spec["pp"]
+        if len(tensors) != len(names):
+            raise RuntimeError(
+                f"SGLang decode CUDA graph restored {len(tensors)} output tensors, "
+                f"the archive records {len(names)} ({names})"
+            )
+        return PPProxyTensors(dict(zip(names, tensors, strict=True)))
+    if len(tensors) != 1:
+        raise RuntimeError(f"Expected one SGLang CUDA graph output tensor, got {len(tensors)}")
+    return LogitsProcessorOutput(next_token_logits=tensors[0])
 
 
 def _scan_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[str, Any]]]:
@@ -198,8 +220,10 @@ def save_graph(graph, output: Any, key: Any, prefill_req_slots: int | None = Non
         raise RuntimeError("Foundry SGLang graph extension is not initialized")
 
     if prefill_req_slots is None:
-        packed_output = _pack_output(output)
         filename = _graph_filename(state.capture_index, key)
+        packed_output, spec = _pack_output(output)
+        if spec is not None:
+            _decode_output_specs[filename] = spec
     else:
         filename = _prefill_graph_filename(state.capture_index, key, prefill_req_slots)
         spec, tensors = _flatten_prefill_output(output)
@@ -224,6 +248,16 @@ def save_graph_manifest() -> None:
     foundry_pkg.save_graph_manifest(
         cfg.workspace_dir, enable_templates=cfg.graph_templates, partition=graph_partition
     )
+
+
+def save_decode_graph_state() -> None:
+    """SAVE, after the decode capture loop: write the rank's decode record
+    (see _DECODE_STATE_FILE) when some decode output is not the logits."""
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None or not _decode_output_specs:
+        return
+    with open(os.path.join(cfg.workspace_dir, _DECODE_STATE_FILE), "w") as f:
+        json.dump({"output_specs": _decode_output_specs}, f, indent=2)
 
 
 def save_prefill_graph_state(*, req_slots: int, has_dp_gather: bool) -> None:
@@ -834,6 +868,8 @@ class _DecodeRestore:
     pending: Any
     graph_files: list[tuple[int, str, dict[str, Any]]]
     timing: _RestoreTiming
+    # filename -> output spec of the graphs that do not return the logits.
+    output_specs: dict[str, Any] = field(default_factory=dict)
     next: int = 0
 
 
@@ -861,11 +897,20 @@ def start_decode_graph_restore() -> None:
     # Single-GPU dense models have no NVSHMEM modules (no-op there).
     cge.init_nvshmem_for_loaded_modules()
 
+    output_specs = {}
+    record_path = os.path.join(cfg.workspace_dir, _DECODE_STATE_FILE)
+    if os.path.exists(record_path):
+        with open(record_path) as f:
+            output_specs = json.load(f).get("output_specs", {})
+
     t0 = time.perf_counter()
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
     _decode_restore = _DecodeRestore(
-        pending=pending, graph_files=graph_files, timing=_RestoreTiming(t0=t0)
+        pending=pending,
+        graph_files=graph_files,
+        timing=_RestoreTiming(t0=t0),
+        output_specs=output_specs,
     )
 
 
@@ -895,7 +940,7 @@ def restore_next_decode_graph(key: Any) -> tuple[Any, Any]:
         graph, tensors = FoundryCUDAGraph.finish_one_graph_load(r.pending, r.next)
     r.timing.calls.append((t, time.perf_counter()))
     r.next += 1
-    output = _unpack_output(tensors)
+    output = _unpack_output(tensors, r.output_specs.get(filename))
     # Strong reference next to the backend's own.
     state.loaded_graphs[bs] = (graph, output)
     return graph, output

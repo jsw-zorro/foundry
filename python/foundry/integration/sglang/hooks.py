@@ -563,8 +563,13 @@ def _decode_capture_scope(model):
     # SAVE: the same upstream loop; capture_one captures and saves each graph.
     yield
 
-    from foundry.integration.sglang.graph_ops import pack_fatbins, save_graph_manifest
+    from foundry.integration.sglang.graph_ops import (
+        pack_fatbins,
+        save_decode_graph_state,
+        save_graph_manifest,
+    )
 
+    save_decode_graph_state()
     save_graph_manifest()
     pack_fatbins()
     rt.record_region_layout()
