@@ -277,9 +277,9 @@ def _elastic_recapture_path_exists() -> bool:
 
 def reject_unsupported_features(server_args: Any) -> None:
     """Features whose graphs Foundry cannot save or restore, rejected once
-    they are resolved. Pipeline parallelism is allowed: the workspace rank
-    includes the PP rank and non-last-rank outputs (PPProxyTensors) are
-    persisted, but it has not been exercised on a GPU."""
+    they are resolved. Pipeline parallelism is supported: the workspace rank
+    includes the PP rank and the non-last stages' PPProxyTensors outputs are
+    persisted (decode: decode_graphs.json; prefill: prefill_graphs.json)."""
     from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(server_args)

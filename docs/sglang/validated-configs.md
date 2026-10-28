@@ -9,6 +9,36 @@ Every model and configuration that passed Foundry SAVE + LOAD with SGLang, with 
 
 "Dummy text" parity means the greedy completion was identical under dummy weights. It shows that the same kernels ran, not model quality.
 
+## Plugin route on upstream main, torch 2.14.1, H200 (2026-10-28)
+
+sglang upstream main `2c83dc6656` (no Foundry adapter: `FOUNDRY_GRAPH_EXTENSION_CONFIG`) + foundry-core 0.1.0rc3
+(this branch), torch 2.14.1 / cu130, driver 580.159 (CUDA 13.0), `lmsysorg/sglang` dev image, 8xH200 node.
+`tests/sgl/e2e`: native graph, SAVE and LOAD of the same engine; greedy ids of SAVE and LOAD equal to native, SAVE
+`final_alloc_offset` equal to the LOAD offset on every rank, no `[HOOK] ERROR`. Capture is sglang's native decode
+capture, restore is the LOAD restore (max over ranks); TPOT is the median of 32 requests at concurrency 8.
+
+| model | layout | weights | decode graphs per rank | native capture -> restore (s) | TPOT native -> LOAD (ms) |
+|---|---|---|---|---|---|
+| Qwen3-1.7B | 1 GPU | dummy | 4 | 2.3 -> 0.014 | not measured |
+| Qwen3.5-35B-A3B | TP2 | real | 64 | 15.6 -> 0.29 | 10.51 -> 10.09 |
+| Qwen3.5-35B-A3B | EP2, DP attention, DeepEP LL | real | 64 | 15.7 -> 0.40 | 14.88 -> 14.95 |
+| Qwen3.5-35B-A3B | attn TP2 + EP2, DeepEP LL | real | 64 | 17.7 -> 0.84 | 29.19 -> 28.18 |
+| Qwen3-30B-A3B | PP2 | dummy | 64 | 12.0 -> 0.17 | 14.54 -> 14.63 |
+| Qwen3-30B-A3B | TP2 x PP2 (4 GPUs) | dummy | 64 | 7.9 -> 0.15 | 14.17 -> 14.08 |
+
+The same 1-GPU test and the TP2 and EP2 rows also pass with `FOUNDRY_ENABLE_EXEC_SHARE=1` on LOAD.
+
+The recipe scripts as shipped (plugin route chosen by `persist.sh`), each run natively, with `--save` and with
+`--load`; greedy output of 3 prompts x 24 tokens identical to native in every case. `/health` is measured from the
+script start; two engines ran at the same time on the host, so the times include that contention.
+
+| script | GPUs | weights | decode graphs restored per rank | restore (s) | `/health` native -> LOAD (s) |
+|---|---|---|---|---|---|
+| `serve_qwen3-mini.sh` | 1 | real | 52 | 0.11 | 63 -> 55 |
+| `serve_qwen3-1.7b_dp.sh 2` | 2 | real | 256 | 0.56 | 83 -> 71 |
+| `serve_qwen3-1.7b_tp.sh 2` | 2 | real | 256 | 0.81 | 77 -> 61 |
+| `serve_qwen3.5-35ba3b.sh tp2` | 2 | real | 256 | 1.10 | 135 -> 71 |
+
 ## Dependency route, torch 2.14.1, 4xH200 (2026-10-11)
 
 sglang `--cuda-graph-persistence` (PR branch `d487b80da4` on upstream `234ccba7f6`) + foundry-core 0.1.0rc2 (`a7fe034`), torch 2.14.1 / cu130. Times are launch to the first `/health` 200 in the

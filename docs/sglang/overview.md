@@ -20,6 +20,7 @@ same code as the plugin's (`plugin.py`, `hooks.py`); only the messages name the 
 | Single GPU | ✅ | Qwen3-1.7B / 4B / 14B |
 | Data parallel (DP) | ✅ | One full replica per rank; validated DP=2. Requires the per-rank device binding (below); `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0` are pinned by the plugin. |
 | Tensor parallel (TP) | ✅ | torch symmetric-memory allreduce inside the decode graphs (`--enable-torch-symm-mem --disable-custom-all-reduce`, pinned by the plugin); validated TP=2 (Qwen3-1.7B, Qwen3-32B) and TP=4 (Qwen3-32B). Without multicast (no IMEX channels) LOAD needs the optional sglang branch `symm-mem-no-multicast-fallback` (two-shot instead of disabling the communicator). |
+| Pipeline parallel (PP) | ✅ | The decode graphs of a non-last stage return `PPProxyTensors`; SAVE records their structure (`decode_graphs.json` per rank) and LOAD rebuilds it. Validated PP=2 and TP=2 x PP=2 (Qwen3-30B-A3B, `tests/sgl/e2e`). |
 | Expert parallel (DeepEP) | ✅ | DP attention + DeepEP low-latency, TP attention + EP, and attention-TP inside DP groups + EP; DeepEP v2. Validated up to EP8 (Qwen3.5-122B/397B, DeepSeek-V4-Flash, GLM, Inkling; see `recipe/sglang/README.md` **Validation**). See **Expert parallel** below. |
 
 **Expert parallel (DeepEP).** The default EP recipe runs DP-attention + DeepEP for the
