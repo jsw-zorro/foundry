@@ -68,6 +68,9 @@ def region(monkeypatch, tmp_path):
     monkeypatch.setattr(rt.cge, "get_current_alloc_offset", lambda: cursor[0])
     monkeypatch.setattr(rt.cge, "set_current_alloc_offset", lambda v: cursor.__setitem__(0, v))
     monkeypatch.setattr(rt, "_scratch_end_offset", None)
+    monkeypatch.setattr(rt, "_offset_trail", {})
+    monkeypatch.setattr(rt, "_trail_started", False)
+    monkeypatch.setattr(rt, "_saved_trail", None)
 
     def use(mode, offset, layout=None):
         cfg = CUDAGraphExtensionConfig(
@@ -221,3 +224,32 @@ def test_recapture_after_startup_captures_in_place(monkeypatch):
         assert hooks.capture_one("key", lambda: "out", pool="p", stream="s") == ("graph", "out")
     assert captured == [("p", "s")]
     assert hooks._scope is None and not hooks._recapturing
+
+
+def test_load_stops_at_the_first_checkpoint_that_differs_from_save(region, monkeypatch):
+    """From the scratch boundary on, SAVE records the offset at every
+    alloc_offset checkpoint; LOAD compares each checkpoint it shares with SAVE
+    and stops at the first difference. Checkpoints before the boundary (which
+    the boundary absorbs) and checkpoints of one mode only are not compared."""
+    rt = region("save", 0)
+    for label, offset in (("after_init_torch_dist", 300), ("after_scratch_skip", 1024),
+                          ("before_init_memory_pool", 5000), ("after_lazy_runtimes", 6000)):  # fmt: skip
+        region.cursor[0] = offset * MB
+        rt.log_alloc_offset(label)
+    assert set(rt._offset_trail) == {
+        "after_scratch_skip",
+        "before_init_memory_pool",
+        "after_lazy_runtimes",
+    }
+    layout = {"offset_trail": rt._offset_trail}
+
+    rt = region("load", 0, layout=layout)
+    monkeypatch.setattr(rt, "_trail_started", False)
+    monkeypatch.setattr(rt, "_saved_trail", None)
+    for label, offset in (("after_init_torch_dist", 280), ("after_scratch_skip", 1024),
+                          ("before_init_memory_pool", 5000), ("before_preallocate", 7000)):  # fmt: skip
+        region.cursor[0] = offset * MB
+        rt.log_alloc_offset(label)
+    region.cursor[0] = 5016 * MB
+    with pytest.raises(RuntimeError, match=r"before_init_memory_pool is .*\+16 MB"):
+        rt.log_alloc_offset("before_init_memory_pool")

@@ -98,6 +98,13 @@ _FINGERPRINT_ARGS = (
     "max_loras_per_batch",
 )  # fmt: skip
 _FINGERPRINT_ENV = ("CUDA_MODULE_LOADING", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK")
+# Allocation offsets at the checkpoints from the scratch boundary on (the
+# alloc_offset[...] log lines): SAVE records them in _LAYOUT_FILE, LOAD compares
+# every checkpoint it shares with SAVE and stops at the first difference.
+_TRAIL_FROM = "after_scratch_skip"
+_offset_trail: dict[str, int] = {}
+_trail_started = False
+_saved_trail: dict[str, int] | None = None
 # Where weight loading starts: the scratch boundary, or (SAVE) the cursor when
 # distributed init allocated past it. Recorded in _LAYOUT_FILE; LOAD moves to it.
 _scratch_end_offset: int | None = None
@@ -493,6 +500,7 @@ def record_region_layout() -> int:
         ranges = cge.get_live_region_ranges()
         layout = {
             "scratch_end_offset": _scratch_end_offset,
+            "offset_trail": dict(_offset_trail),
             "start_offset": _layout_start_offset,
             "final_alloc_offset": _final_alloc_offset,
             "live_ranges": ranges,
@@ -620,7 +628,31 @@ def preallocate_for_load_mode() -> None:
     )
 
 
+def _check_offset_trail(cfg, label: str, offset: int) -> None:
+    """LOAD: the offset at ``label`` must equal SAVE's. A difference after the
+    scratch boundary means the allocation sequences diverged (another loader
+    path, other server settings or environment); weights, KV pool and the
+    graphs' buffers would no longer sit where the archive addresses them."""
+    global _saved_trail
+    if _saved_trail is None:
+        path = os.path.join(cfg.workspace_dir, _LAYOUT_FILE)
+        try:
+            with open(path) as f:
+                _saved_trail = {k: int(v) for k, v in json.load(f).get("offset_trail", {}).items()}
+        except (OSError, ValueError):
+            _saved_trail = {}
+    saved = _saved_trail.get(label)
+    if saved is not None and saved != offset:
+        raise RuntimeError(
+            f"Foundry LOAD: allocation offset at {label} is {offset}, SAVE had {saved} "
+            f"({(offset - saved) / 2**20:+.0f} MB): the allocation sequences diverged since the "
+            "previous checkpoint (compare the 'alloc_offset[...]' lines of both logs). Serve "
+            "with the settings and environment of the SAVE run, or re-SAVE."
+        )
+
+
 def log_alloc_offset(label: str) -> None:
+    global _trail_started
     cfg = get_config()
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return
@@ -639,6 +671,12 @@ def log_alloc_offset(label: str) -> None:
         offset / (1024 * 1024),
         free_mb,
     )
+    _trail_started = _trail_started or label == _TRAIL_FROM
+    if _trail_started:
+        if cfg.mode == CUDAGraphExtensionMode.SAVE:
+            _offset_trail[label] = offset
+        elif cfg.workspace_dir is not None:
+            _check_offset_trail(cfg, label, offset)
 
 
 def _set_subprocess_preload_env() -> None:

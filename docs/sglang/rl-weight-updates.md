@@ -20,6 +20,10 @@ The LOAD engines use one archive, saved with `--load-format dummy`.
 | dummy start, 3 rounds of `/update_weights_from_distributed` (NCCL broadcast from the trainer, P2P/IPC) | runs | identical to native, with the trainer settings below; without them the first broadcast hangs |
 | dummy start, `/update_weights_from_disk` with `recapture_cuda_graph=true` | the next decode fails with an illegal memory access | the decode graphs are captured again in place; identical to native without the recapture |
 
+The same restart, SAVE with dummy weights and LOAD with the real checkpoint, also gives outputs identical to a native
+start with the real checkpoint for Qwen3.5-35B-A3B (hybrid linear attention, MoE, BF16; one H200), with every
+allocation checkpoint at the same offset as on SAVE.
+
 The three update paths give the same outputs as each other. They differ from a start with the real checkpoint by
 up to 6.1 in logprob, on the native engine as well; the cause is not determined and does not involve Foundry.
 
@@ -35,6 +39,10 @@ up to 6.1 in logprob, on the native engine as well; the cause is not determined 
   next LOAD restores those. Before this was handled, the second restore aborted the process.
 - **Allocations after startup** are plain driver allocations: the allocation region closes after the last
   startup capture or restore (`[Foundry] SGLang allocation region closed after startup`).
+- **A restart with another checkpoint, settings or host** must allocate exactly as SAVE did. SAVE records the
+  offset at every `alloc_offset[...]` checkpoint from the scratch boundary on, and LOAD stops at the first
+  checkpoint that differs, with both offsets in the error. A loader that allocates device memory while loading a
+  checkpoint (not seen in the two models above) would show up there.
 
 ## Not supported
 
@@ -46,5 +54,4 @@ up to 6.1 in logprob, on the native engine as well; the cause is not determined 
 - Speculative decoding and LoRA are rejected at startup (see [`overview.md`](overview.md)).
 
 Not measured: tensor-parallel engines, FP8 checkpoints (whose weight processing on update differs), flattened-bucket
-updates, a trainer on another node, and engines restarted from an archive saved with another checkpoint of a model
-whose loader allocates device memory while loading.
+updates and a trainer on another node.
