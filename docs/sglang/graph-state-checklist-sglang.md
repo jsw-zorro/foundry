@@ -235,7 +235,8 @@ Rank = likelihood a real deployment hits it × how silent the failure is.
    - SM-count grids;
    - the DeepGEMM masked-layout budget, which comes from free memory at SAVE.
 
-   LOAD never compares GPU identity: `warmup_state.json` stores `gpu_name` but never checks it.
+   LOAD compares GPU identity (name, compute capability, SM count, memory) with SAVE's through
+   `rank_<N>/fingerprint.json` and refuses a mismatch; the free-memory-derived masked-layout budget is not compared.
 9. **Pinned-host H2D memcpy nodes** (`--cpu-offload-gb`, possibly the DSV4 c_plan prefill path). A UVA-reported
    endpoint would escape the `srcHost` check **[spec]**.
 10. **Env pins that live only in the recipe, not in the plugin:**

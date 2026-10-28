@@ -136,3 +136,62 @@ def test_load_cursor_ahead_of_the_layout_start_is_an_error(region, monkeypatch):
     rt = region("load", 5010 * MB, layout=layout)
     with pytest.raises(RuntimeError, match="past SAVE's layout start"):
         rt.preallocate_for_load_mode()
+
+
+def _server_args(model_dir, **overrides):
+    import types
+
+    args = {"model_path": str(model_dir), "tp_size": 2, "ep_size": 2, "port": 30000}
+    args.update(overrides)
+    return types.SimpleNamespace(**args)
+
+
+def test_archive_fingerprint_refuses_other_settings(region, tmp_path, monkeypatch):
+    """SAVE records the settings that shape the archive; LOAD under another
+    parallel layout or batch limit stops at setup, while a setting outside the
+    record (the port) or a moved model directory with the same config.json
+    does not. An archive without the record, or the override, skips the check."""
+    from types import SimpleNamespace
+
+    props = SimpleNamespace(
+        name="GPU-X", major=9, minor=0, multi_processor_count=132, total_memory=1
+    )
+    rt = region("save", 0)
+    monkeypatch.setattr(rt, "_full_server_args", lambda server_args: server_args)
+    monkeypatch.setattr(rt.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(rt.torch.cuda, "get_device_properties", lambda device: props)
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text('{"hidden_size": 16}')
+    saved = rt.archive_fingerprint(_server_args(model))
+    (tmp_path / rt._FINGERPRINT_FILE).write_text(json.dumps(saved))
+    assert saved["model_path"].startswith("config.json sha256:") and saved["gpu"] == "GPU-X"
+
+    rt = region("load", 0)
+    moved = tmp_path / "elsewhere"
+    moved.mkdir()
+    (moved / "config.json").write_text('{"hidden_size": 16}')
+    rt.check_archive_fingerprint(_server_args(moved, port=31000))
+    with pytest.raises(RuntimeError, match="tp_size: SAVE 2, LOAD 4"):
+        rt.check_archive_fingerprint(_server_args(model, tp_size=4))
+    with pytest.raises(RuntimeError, match="max_running_requests"):
+        rt.check_archive_fingerprint(_server_args(model, max_running_requests=64))
+    monkeypatch.setenv("FOUNDRY_SGLANG_SKIP_FINGERPRINT", "1")
+    rt.check_archive_fingerprint(_server_args(model, tp_size=4))
+    monkeypatch.delenv("FOUNDRY_SGLANG_SKIP_FINGERPRINT")
+    (tmp_path / rt._FINGERPRINT_FILE).unlink()
+    rt.check_archive_fingerprint(_server_args(model, tp_size=4))
+
+
+def test_archive_fingerprint_reads_the_full_server_args(monkeypatch):
+    """The plugin route's setup receives sglang's parallel bag, which has no
+    model or batch fields; the fingerprint reads the operator's whole record
+    from sglang's runtime context."""
+    import types
+
+    import sglang.srt.runtime_context as context
+    from foundry.integration.sglang import runtime as rt
+
+    full = types.SimpleNamespace(max_running_requests=8)
+    monkeypatch.setattr(context, "get_server_args", lambda: full)
+    assert rt._full_server_args(types.SimpleNamespace(tp_size=1)) is full

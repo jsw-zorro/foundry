@@ -79,7 +79,7 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 | PTX inputs | re-JITted at LOAD by the possibly different driver; not checked |
 | `__device__`/`__constant__` globals written from the host before capture (`cudaMemcpyToSymbol`) | **not recorded, not applied**: LOAD's copy starts from the ELF initialisers; only NVSHMEM's state is handled — **gap G2b** |
 | addresses of module globals passed as kernel params; texture/surface handles | raw bytes replayed; per-process, not detected — **gap G5** |
-| GPU architecture, SM count, driver + compat version, `CUDA_MODULE_LOADING`, kernel-selecting `SGLANG_*` envs | `gpu_name`/`cuda_version` stored in warmup_state.json, **never compared** — **gap G7**; sglang bakes the SM count into grids (EP MoE, marlin, tiny_gemm, mega_moe) and topk_v2 bakes occupancy macros into its build |
+| GPU architecture, SM count, driver + compat version, `CUDA_MODULE_LOADING`, kernel-selecting `SGLANG_*` envs | GPU name, compute capability, SM count and memory, driver, CUDA, torch, sglang and Foundry versions, `CUDA_MODULE_LOADING` and the DeepEP dispatch size recorded per rank in `fingerprint.json` and compared at LOAD setup, which refuses a mismatch (with the server arguments that shape the graphs); other kernel-selecting `SGLANG_*` envs are not recorded — **gap G7** (partly closed); sglang bakes the SM count into grids (EP MoE, marlin, tiny_gemm, mega_moe) and topk_v2 bakes occupancy macros into its build |
 | device limits (malloc heap, stack, L2 set-aside), green contexts / exec affinity, MPS | not handled; rare — gap G10 |
 
 ### 2.5 Memory and pointers

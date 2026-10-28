@@ -96,7 +96,8 @@ foundry_archive/
     graph_{0..N-1}_FULL_t{bs}_r{bs}_UX_pcN.json       # one per captured graph
     graph_{0..N-1}_FULL_t{bs}_r{bs}_UX_pcN.cugraph    # binary cuGraph blob
     graph_manifest.json                   # topology groups for template + on-demand linking
-    region_layout.json                    # per-rank layout: start offset, watermark, live ranges
+    region_layout.json                    # per-rank layout: scratch boundary, start offset, watermark, live ranges
+    fingerprint.json                      # settings, versions and GPU of SAVE; LOAD refuses a mismatch
     fatbin_image_packed.img               # packed kernel fatbins
     fatbin_entrypoint_packed.txt          # fatbin entry-point index
 ```

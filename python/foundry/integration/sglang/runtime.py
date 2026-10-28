@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -77,6 +78,26 @@ _LAYOUT_FILE = "region_layout.json"
 CAPTURE_LOOP_VERSION = 2
 _layout_start_offset: int | None = None
 _final_alloc_offset: int = 0
+# Per-rank record of what SAVE ran with, written at SAVE's setup and compared at
+# LOAD's (check_archive_fingerprint): the server arguments below, which shape the
+# captured graphs or size the buffers they address, the variables in
+# _FINGERPRINT_ENV, the software versions and the GPU.
+_FINGERPRINT_FILE = "fingerprint.json"
+_FINGERPRINT_ARGS = (
+    "model_path", "revision", "dtype", "quantization", "kv_cache_dtype", "context_length",
+    "tp_size", "pp_size", "dp_size", "attn_dp_size", "attn_cp_size", "ep_size", "moe_dp_size",
+    "nnodes", "enable_dp_attention", "enable_dp_lm_head", "moe_dense_tp_size",
+    "ep_num_redundant_experts", "attention_backend", "prefill_attention_backend",
+    "decode_attention_backend", "moe_a2a_backend", "deepep_mode", "moe_runner_backend",
+    "enable_torch_symm_mem", "disable_custom_all_reduce", "enable_two_batch_overlap",
+    "enable_single_batch_overlap", "page_size", "max_running_requests", "chunked_prefill_size",
+    "max_prefill_tokens", "cuda_graph_config", "cuda_graph_bs_decode", "cuda_graph_max_bs_decode",
+    "cuda_graph_backend_prefill", "cuda_graph_bs_prefill", "disable_cuda_graph_padding",
+    "speculative_algorithm", "speculative_num_steps", "speculative_eagle_topk",
+    "speculative_num_draft_tokens", "speculative_draft_model_path", "enable_lora",
+    "max_loras_per_batch",
+)  # fmt: skip
+_FINGERPRINT_ENV = ("CUDA_MODULE_LOADING", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK")
 # Where weight loading starts: the scratch boundary, or (SAVE) the cursor when
 # distributed init allocated past it. Recorded in _LAYOUT_FILE; LOAD moves to it.
 _scratch_end_offset: int | None = None
@@ -162,6 +183,111 @@ def load_warmup_state() -> WarmupState:
     return WarmupState(**{k: v for k, v in data.items() if k in valid})
 
 
+def _model_identity(model_path) -> str:
+    """The digest of config.json for a local model directory (the path may
+    differ between hosts), else the path or hub id as given."""
+    config = os.path.join(str(model_path), "config.json")
+    if os.path.isfile(config):
+        with open(config, "rb") as f:
+            return "config.json sha256:" + hashlib.sha256(f.read()).hexdigest()
+    return str(model_path)
+
+
+def _driver_version() -> str | None:
+    """The kernel driver version (NVML), else the driver API version."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        version = pynvml.nvmlSystemGetDriverVersion()
+        return version.decode() if isinstance(version, bytes) else str(version)
+    except Exception:
+        pass
+    try:
+        return f"driver API {torch._C._cuda_getDriverVersion()}"
+    except Exception:
+        return None
+
+
+def _full_server_args(server_args):
+    """The operator's ServerArgs record. The plugin route's setup receives the
+    parallel bag (get_parallel()), which lacks most fields; sglang's runtime
+    context holds the whole record."""
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        full = get_server_args()
+    except Exception:
+        full = None
+    return server_args if full is None else full
+
+
+def archive_fingerprint(server_args) -> dict:
+    """What an archive is valid for (see _FINGERPRINT_ARGS), as JSON values."""
+    try:
+        from sglang.version import __version__ as sglang_version
+    except Exception:
+        sglang_version = "unknown"
+    from foundry import __version__ as foundry_version
+
+    server_args = _full_server_args(server_args)
+    fp = {name: getattr(server_args, name, None) for name in _FINGERPRINT_ARGS}
+    fp["model_path"] = _model_identity(fp["model_path"])
+    fp.update({f"env {name}": os.environ.get(name) for name in _FINGERPRINT_ENV})
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    fp.update(
+        {
+            "sglang version": sglang_version,
+            "foundry version": foundry_version,
+            "torch version": torch.__version__,
+            "cuda version": torch.version.cuda,
+            "driver version": _driver_version(),
+            "gpu": props.name,
+            "gpu compute capability": f"{props.major}.{props.minor}",
+            "gpu SMs": props.multi_processor_count,
+            "gpu memory": props.total_memory,
+        }
+    )
+    return json.loads(json.dumps(fp, default=_json_value))
+
+
+def _json_value(value) -> str:
+    # An object whose str() is the default repr would differ between runs.
+    text = str(value)
+    return type(value).__qualname__ if " at 0x" in text else text
+
+
+def check_archive_fingerprint(server_args) -> None:
+    """LOAD, at setup (before the weights load): refuse an archive that SAVE
+    wrote under other settings, software or GPU (archive_fingerprint): its
+    graphs address buffers whose sizes and offsets those decide, and its
+    kernels were selected for SAVE's GPU. An archive written before the
+    fingerprint existed is accepted; FOUNDRY_SGLANG_SKIP_FINGERPRINT=1 skips
+    the check."""
+    cfg = get_config()
+    if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD or cfg.workspace_dir is None:
+        return
+    path = os.path.join(cfg.workspace_dir, _FINGERPRINT_FILE)
+    if not os.path.exists(path) or os.environ.get("FOUNDRY_SGLANG_SKIP_FINGERPRINT") == "1":
+        logger.warning("[Foundry] SGLang archive fingerprint not checked (%s)", path)
+        return
+    with open(path) as f:
+        saved = json.load(f)
+    current = archive_fingerprint(server_args)
+    diff = [
+        f"{key}: SAVE {saved.get(key)!r}, LOAD {current.get(key)!r}"
+        for key in sorted(set(saved) | set(current))
+        if saved.get(key) != current.get(key)
+    ]
+    if diff:
+        raise RuntimeError(
+            f"Foundry LOAD: archive {cfg.workspace_dir} was saved under other settings "
+            f"({'; '.join(diff)}). Serve with SAVE's settings or re-SAVE "
+            "(FOUNDRY_SGLANG_SKIP_FINGERPRINT=1 skips this check)."
+        )
+    logger.info("[Foundry] SGLang archive fingerprint matches (%d entries)", len(current))
+
+
 @nvtx_traced("foundry.setup_graph_ext (binary restore)")
 def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int | None) -> None:
     """Set up the VMM region before SGLang initializes NCCL/process groups."""
@@ -191,6 +317,8 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
         if workspace_dir.exists():
             shutil.rmtree(workspace_dir)
         workspace_dir.mkdir(parents=True, exist_ok=True)
+        with open(workspace_dir / _FINGERPRINT_FILE, "w") as f:
+            json.dump(archive_fingerprint(server_args), f, indent=1)
     t_bin = 0.0
     if cfg.mode == CUDAGraphExtensionMode.LOAD:
         cge.set_skip_fatbin_processing(True)

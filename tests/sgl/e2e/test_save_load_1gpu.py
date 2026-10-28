@@ -4,7 +4,9 @@
 model with dummy weights and a small decode set. Greedy output must be
 identical across the three, LOAD must restore every decode graph once, and
 Foundry must report itself active in the launcher and the scheduler. SAVE and LOAD
-first pass the preflight CLI's checks (foundry.integration.sglang.preflight).
+first pass the preflight CLI's checks (foundry.integration.sglang.preflight). A
+second LOAD with another --max-running-requests must stop at setup (the archive
+fingerprint).
 Runs on whichever route the installed sglang has (_sglang_helpers.foundry_launch): the
 --cuda-graph-persistence flags when sglang has the Foundry adapter, the plugin's
 environment variable otherwise.
@@ -51,12 +53,12 @@ _SAMPLING = {"temperature": 0, "max_new_tokens": 32}
 _LOADED = re.compile(r"\[Foundry\] Loaded (\d+) SGLang graphs")
 
 
-def _serve(tmp_path, name, mode=None, toml=None):
+def _serve(tmp_path, name, mode=None, toml=None, args=_ARGS):
     responses, _, log = serve(
         tmp_path,
         name,
         _MODEL,
-        _ARGS,
+        args,
         _PROMPTS,
         _SAMPLING,
         mode=mode,
@@ -90,3 +92,10 @@ def test_save_then_load_matches_native(tmp_path):
     assert loaded == native
     counts = [int(n) for n in _LOADED.findall(load_log)]
     assert counts == [len(_DECODE_BS)], f"LOAD must restore every decode graph once: {counts}"
+
+    other = list(_ARGS)
+    other[other.index("--max-running-requests") + 1] = "4"
+    with pytest.raises(Exception):  # noqa: B017 (the launcher reports the dead scheduler)
+        _serve(tmp_path, "load_other", "load", load_cfg, args=other)
+    log = (tmp_path / "load_other.err").read_text() + (tmp_path / "load_other.out").read_text()
+    assert "max_running_requests: SAVE 8, LOAD 4" in log, "LOAD under other settings must stop"

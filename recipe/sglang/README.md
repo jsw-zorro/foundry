@@ -578,7 +578,8 @@ foundry_archive/
     ├── graph_*.json + .cugraph    # one pair per captured graph
     ├── graph_manifest.json        # topology groups + template assignments
     ├── fatbin_image_packed.img    # packed CUDA modules
-    └── region_layout.json         # per-rank layout: start offset, watermark, live ranges
+    ├── region_layout.json         # per-rank layout: scratch boundary, start offset, watermark, live ranges
+    └── fingerprint.json           # settings, versions and GPU of SAVE; LOAD refuses a mismatch
 ```
 
 For DP / EP each rank gets its own `rank_<N>/`.

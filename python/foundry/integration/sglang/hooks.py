@@ -137,6 +137,7 @@ def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> No
     rt.log_alloc_offset("after_setup_graph_ext")
     if mode == CUDAGraphExtensionMode.LOAD:
         rt.check_capture_loop_version()
+        rt.check_archive_fingerprint(server_args)
         # Grow the driver's graph-exec memory now, on a background thread,
         # so Phase 2's instantiates at the capture point reuse it (see
         # graph_ops.start_exec_pool_prewarm).
