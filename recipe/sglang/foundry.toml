@@ -1,5 +1,7 @@
 # Shared Foundry config for every recipe in this directory.
-# The mode comes from --cuda-graph-persistence {save,load}; a `mode` key here is ignored.
+# The mode comes from the script's --save / --load (persist.sh): passed as
+# --cuda-graph-persistence {save,load} to an SGLang with the Foundry adapter, or, on
+# upstream SGLang (plugin route), written into a copy of this file. A `mode` key here is ignored.
 base_addr = 0x600000000000
 region_size = "256GB"
 workspace_root = "foundry_archive"

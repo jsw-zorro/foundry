@@ -4,12 +4,12 @@
 # nvidia-nccl-cu13 >= 2.30.7, a driver accepting its cu13.3 fatbins (see README) and `cuobjdump` on PATH.
 # Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3bfp8_ep_v2.sh <ep_size> [--save|--load]
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/persist.sh"
 EP_SIZE=${1:?Usage: $0 <ep_size> [--save|--load]}
 PERSIST=()
 case "${2:-}" in
-  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
-  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
-          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  --save) foundry_persist save || exit 1 ;;
+  --load) foundry_persist load || exit 1 ;;
   "") ;;
   *) echo "Usage: $0 <ep_size> [--save|--load]"; exit 1 ;;
 esac

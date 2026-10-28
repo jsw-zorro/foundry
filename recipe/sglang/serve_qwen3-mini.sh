@@ -3,11 +3,11 @@
 # No mode = plain SGLang (also warms the JIT caches before the first --save).
 # Archive: ./foundry_archive (foundry.toml). SGL_MODEL / SGL_EXTRA_ARGS override.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/persist.sh"
 PERSIST=()
 case "${1:-}" in
-  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
-  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
-          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  --save) foundry_persist save || exit 1 ;;
+  --load) foundry_persist load || exit 1 ;;
   "") ;;
   *) echo "Usage: $0 [--save|--load]"; exit 1 ;;
 esac

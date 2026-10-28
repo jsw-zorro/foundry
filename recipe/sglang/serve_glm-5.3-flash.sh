@@ -4,13 +4,13 @@
 # Validated: ep4 on 4xH200 and ep8 on 8xH200 (128 decode graphs/rank). Any epN is passed through;
 # if the checkpoint does not fit, sglang itself reports it. No mode = plain SGLang.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/persist.sh"
 CFG=${1:?Usage: $0 <epN> [--save|--load]}
 case "$CFG" in ep[0-9]*) N=${CFG#ep} ;; *) echo "Usage: $0 <epN> [--save|--load]"; exit 1 ;; esac
 PERSIST=()
 case "${2:-}" in
-  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
-  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
-          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  --save) foundry_persist save || exit 1 ;;
+  --load) foundry_persist load || exit 1 ;;
   "") ;;
   *) echo "Usage: $0 <epN> [--save|--load]"; exit 1 ;;
 esac

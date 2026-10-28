@@ -5,13 +5,13 @@
 # 33.8 s vs 105-127 s native capture). The FP8 checkpoint is ~235 GB: 4 GPUs minimum. epN is untested on this model.
 # Same topology vocabulary as serve_qwen3.5-122ba10b.sh (README "Qwen3.5 and DeepSeek"); no Mamba/GDN state pool here.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/persist.sh"
 CFG=${1:?Usage: $0 <epN|tpepN|tpAepN> [--save|--load]}
 MODEL_PATH="${SGL_MODEL:-Qwen/Qwen3-235B-A22B-FP8}"
 PERSIST=()
 case "${2:-}" in
-  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
-  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
-          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  --save) foundry_persist save || exit 1 ;;
+  --load) foundry_persist load || exit 1 ;;
   "") ;;
   *) echo "Usage: $0 <epN|tpepN|tpAepN> [--save|--load]"; exit 1 ;;
 esac

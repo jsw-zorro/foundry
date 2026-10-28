@@ -4,13 +4,13 @@
 # Validated (2026-09-17, 8xH100): FP8 ep4/tpep4/tp2ep4 at 0.6; ep8 at 0.79 with MAXBS=64; tp4ep8 at 0.65.
 # --max-mamba-cache-size caps the GDN state pool (and thus graphs/rank); see README "Qwen3.5 and DeepSeek".
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/persist.sh"
 CFG=${1:?Usage: $0 <epN|tpepN|tpAepN> [--save|--load]}
 MODEL_PATH="${SGL_MODEL:-Qwen/Qwen3.5-122B-A10B-FP8}"
 PERSIST=()
 case "${2:-}" in
-  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
-  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
-          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  --save) foundry_persist save || exit 1 ;;
+  --load) foundry_persist load || exit 1 ;;
   "") ;;
   *) echo "Usage: $0 <epN|tpepN|tpAepN> [--save|--load]"; exit 1 ;;
 esac

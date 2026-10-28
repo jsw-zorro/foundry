@@ -4,12 +4,12 @@
 # SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8 for FP8. No mode = plain SGLang.
 # Decode graphs for every bs 1..MAXBS (default 256) per rank, no padding; prefill graphs off.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/persist.sh"
 EP_SIZE=${1:?Usage: $0 <ep_size> [--save|--load]}
 PERSIST=()
 case "${2:-}" in
-  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
-  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
-          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  --save) foundry_persist save || exit 1 ;;
+  --load) foundry_persist load || exit 1 ;;
   "") ;;
   *) echo "Usage: $0 <ep_size> [--save|--load]"; exit 1 ;;
 esac

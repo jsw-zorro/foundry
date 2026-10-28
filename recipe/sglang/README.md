@@ -5,21 +5,25 @@ integration.
 
 ## Which versions
 
-These recipes use the **dependency route**: SGLang declares Foundry as an optional
-dependency (`sglang[foundry]`) and switches it on with its own server arguments
-`--cuda-graph-persistence {save,load}` (plus optional `--cuda-graph-persistence-config`).
-That is the route in the foundry-org SGLang branch `foundry-dep` and in upstream SGLang
-once the Foundry adapter lands there. The older plugin route
-(`FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>`, entry point `foundry_sglang_plugin:load`) still
-exists for an SGLang without the adapter; these scripts no longer use it.
+The scripts run on either route, whichever the installed SGLang has (see
+[Activation](#activation---cuda-graph-persistence-or-the-plugin)):
+
+- the **dependency route**: SGLang declares Foundry as an optional dependency
+  (`sglang[foundry]`) and switches it on with its own server arguments
+  `--cuda-graph-persistence {save,load}` (plus optional `--cuda-graph-persistence-config`).
+  That is the route in the foundry-org SGLang branch `foundry-dep` and in upstream SGLang
+  once the Foundry adapter lands there;
+- the **plugin route** for an SGLang without the adapter, upstream main today:
+  `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>`, entry point `foundry_sglang_plugin:load`.
 
 | Component | Version | Notes |
 |---|---|---|
 | SGLang | branch `foundry-dep` (adapter `sglang.srt.utils.foundry_adapter`) | Requires Foundry integration API **2.x**; without `--cuda-graph-persistence` every Foundry call site is a no-op. |
+| SGLang | upstream main (validated `2c83dc6656`, 2026-10-28) | Plugin route; the scripts export `FOUNDRY_GRAPH_EXTENSION_CONFIG` themselves. |
 | Foundry | `foundry-core 0.1.0rc2` (this branch, `INTEGRATION_API_VERSION = (2, 0)`) | `pip install "sglang[foundry]"`, or `pip install -e .` from this repo. The wheel must match the torch/CUDA pair SGLang pins (torch 2.14.1 / cu130 for 0.1.0rc2; use the per-pair index in the top-level README for other pairs). |
 
 All scripts share one `foundry.toml` (`workspace_root = "foundry_archive"`); its `mode`
-key, if present, is ignored — the flag's mode wins. Pick a script for your model +
+key, if present, is ignored — the script's `--save` / `--load` wins on both routes. Pick a script for your model +
 parallelism, run `--save`, then `--load`, then query. Integration code:
 [`../../python/foundry/integration/sglang/`](../../python/foundry/integration/sglang/);
 design notes: [`../../docs/sglang/`](../../docs/sglang/). Numbers under **Validation**
@@ -42,7 +46,8 @@ recipe/sglang/
 ├── serve_qwen3.5-35ba3b.sh         # Qwen3.5-35B-A3B      MoE hybrid; tp2/tp4, ep2-8, tpep2/tpep4
 ├── serve_qwen3.5-122ba10b.sh       # Qwen3.5-122B-A10B    MoE hybrid, FP8 (default) or bf16; ep4, tpep4, tp2ep4, ep8, tp4ep8
 ├── serve_deepseek-v4-flash.sh      # DeepSeek-V4-Flash    sgl-project FP8 checkpoint; epN (DP attention + DeepEP)
-└── serve_glm-5.3-flash.sh          # GLM-5.3-Flash (FP8)  epN (DP attention + DeepEP, DSA)
+├── serve_glm-5.3-flash.sh          # GLM-5.3-Flash (FP8)  epN (DP attention + DeepEP, DSA)
+└── persist.sh                      # foundry_persist save|load: the activation for the installed SGLang
 ```
 
 Every script accepts the same trailing `--save` / `--load` flag. Scripts that scale
@@ -112,22 +117,36 @@ model or topology before SAVE.
 | Expert parallel, DeepEP v2 | `serve_qwen3-30ba3bfp8_ep_v2.sh` | Qwen3-30B-A3B-FP8 | NCCL symmetric windows + GIN instead of NVSHMEM; needs NCCL >= 2.30.7 (see below) |
 | Large MoE | `serve_qwen3-235ba22b.sh` | Qwen3-235B-A22B-FP8 | same `<cfg>` vocabulary as the Qwen3.5 scripts; validated tpep4 / tp2ep4 on 4xH200 at 0.7, chunked prefill 2048 |
 
-## Activation: `--cuda-graph-persistence`
+## Activation: `--cuda-graph-persistence` or the plugin
 
-Each script is a plain `sglang serve` command. `--save` / `--load` appends
-`--cuda-graph-persistence save|load --cuda-graph-persistence-config <dir>/foundry.toml`;
-no mode runs plain SGLang (the baseline, also the JIT warm-up before the first SAVE).
+Each script is a plain `sglang serve` command; no mode runs plain SGLang (the baseline, also
+the JIT warm-up before the first SAVE). `--save` / `--load` calls `foundry_persist`
+([`persist.sh`](persist.sh)), which picks the route the installed SGLang has:
+
+- SGLang with the Foundry adapter (`sglang.srt.utils.foundry_adapter`, the fork branch
+  `foundry-dep`): it appends
+  `--cuda-graph-persistence save|load --cuda-graph-persistence-config <dir>/foundry.toml`.
+- SGLang without it (upstream main): that flag does not exist there, so the script exports
+  `FOUNDRY_GRAPH_EXTENSION_CONFIG` instead (the plugin route), naming a copy of `foundry.toml`
+  with `mode = "save"` or `"load"` added (`.foundry.<mode>.toml` next to it, or under
+  `FOUNDRY_PLUGIN_TOML_DIR`).
+
 Without the scripts, the equivalent is simply:
 
 ```bash
 sglang serve --model-path Qwen/Qwen3-1.7B --cuda-graph-persistence save   # first start
 sglang serve --model-path Qwen/Qwen3-1.7B --cuda-graph-persistence load   # later starts
+
+# upstream SGLang (plugin route): the TOML carries the mode
+FOUNDRY_GRAPH_EXTENSION_CONFIG=foundry_save.toml sglang serve --model-path Qwen/Qwen3-1.7B
+FOUNDRY_GRAPH_EXTENSION_CONFIG=foundry_load.toml sglang serve --model-path Qwen/Qwen3-1.7B
 ```
 
 The config argument is optional (`./foundry_archive` is the default archive). If Foundry
 is not installed, SGLang stops at startup with the install hint
 (`pip install "sglang[foundry]"`); a wrong integration-API major does the same. To check
-by hand before launching: `python -P -m foundry.integration.sglang.preflight --toml recipe/sglang/foundry.toml --save|--load`.
+by hand before launching: `python -P -m foundry.integration.sglang.preflight --toml recipe/sglang/foundry.toml --save|--load`
+(on the plugin route, pass the TOML that carries the mode).
 
 ### What Foundry pins, and what the scripts still set
 

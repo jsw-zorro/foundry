@@ -93,7 +93,7 @@ windows). Every SGLang configuration is validated with the full decode-graph set
 (batch sizes 1..256) for restore time, per-token latency and greedy-output
 equality against unmodified SGLang; see [`recipe/sglang/README.md`](recipe/sglang/README.md#validation).
 
-The adapted SGLang fork is published at [`foundry-org/sglang`](https://github.com/foundry-org/sglang), branch `foundry-dep`: SGLang declares Foundry as an optional dependency (`sglang[foundry]`) and calls it through its in-tree adapter when `--cuda-graph-persistence` is set. See the [SGLang recipe](recipe/sglang/README.md) for the supported versions.
+The adapted SGLang fork is published at [`foundry-org/sglang`](https://github.com/foundry-org/sglang), branch `foundry-dep`: SGLang declares Foundry as an optional dependency (`sglang[foundry]`) and calls it through its in-tree adapter when `--cuda-graph-persistence` is set. Upstream SGLang main, which has no adapter, loads Foundry as a plugin (`FOUNDRY_GRAPH_EXTENSION_CONFIG`; last validated on `2c83dc6656`, 2026-10-28), and the recipe scripts pick that route by themselves. See the [SGLang recipe](recipe/sglang/README.md) for the supported versions.
 
 ### Performance
 

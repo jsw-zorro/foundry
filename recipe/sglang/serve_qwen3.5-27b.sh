@@ -3,12 +3,12 @@
 # Validated (2026-09-16, 8xH100): every topology listed, mem-fraction 0.8, 256 decode graphs.
 # No mode = plain SGLang. MAXBS / MEMFRAC / PORT / SGL_EXTRA_ARGS override.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/persist.sh"
 CFG=${1:?Usage: $0 <single|dpN|tpN> [--save|--load]}
 PERSIST=()
 case "${2:-}" in
-  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
-  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
-          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  --save) foundry_persist save || exit 1 ;;
+  --load) foundry_persist load || exit 1 ;;
   "") ;;
   *) echo "Usage: $0 <single|dpN|tpN> [--save|--load]"; exit 1 ;;
 esac

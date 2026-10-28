@@ -4,12 +4,12 @@
 # No mode = plain SGLang. Archive: ./foundry_archive (foundry.toml).
 # Decode graphs for every bs 1..MAXBS (default 256) per rank, no padding; prefill graphs off.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/persist.sh"
 TP_SIZE=${1:?Usage: $0 <tp_size> [--save|--load]}
 PERSIST=()
 case "${2:-}" in
-  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
-  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
-          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  --save) foundry_persist save || exit 1 ;;
+  --load) foundry_persist load || exit 1 ;;
   "") ;;
   *) echo "Usage: $0 <tp_size> [--save|--load]"; exit 1 ;;
 esac

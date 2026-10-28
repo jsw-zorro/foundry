@@ -5,12 +5,12 @@
 # Decode graphs for MAXBS (default 256) batch sizes per rank, no padding; prefill graphs off. The batch is
 # scattered over the EP_SIZE attention-TP ranks, so the captured sizes are EP_SIZE, 2*EP_SIZE, .., MAXBS*EP_SIZE.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/persist.sh"
 EP_SIZE=${1:?Usage: $0 <ep_size> [--save|--load]}
 PERSIST=()
 case "${2:-}" in
-  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
-  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
-          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  --save) foundry_persist save || exit 1 ;;
+  --load) foundry_persist load || exit 1 ;;
   "") ;;
   *) echo "Usage: $0 <ep_size> [--save|--load]"; exit 1 ;;
 esac
