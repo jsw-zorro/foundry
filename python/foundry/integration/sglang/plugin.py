@@ -62,6 +62,7 @@ this way). They are re-asserted at the top of every scheduler process
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -90,6 +91,8 @@ RESOLUTION_HOOK_STEPS = (
     "handle_other_validations",
 )
 _ACTIVATED = False
+# The FOUNDRY_GRAPH_EXTENSION_CONFIG value this process activated with.
+_ACTIVATED_CONFIG: str | None = None
 
 
 def activate(cfg_path: str) -> None:
@@ -98,7 +101,7 @@ def activate(cfg_path: str) -> None:
     ``load_plugins()`` logs and swallows exceptions from a plugin, which would
     leave SGLang running natively while the user asked for SAVE or LOAD, so a
     failure here exits the process (SystemExit is not an ``Exception``)."""
-    global _ACTIVATED
+    global _ACTIVATED, _ACTIVATED_CONFIG
     if _ACTIVATED:
         return
     from foundry.integration.sglang import api
@@ -122,12 +125,29 @@ def activate(cfg_path: str) -> None:
             f"[Foundry] sglang plugin failed to activate ({CONFIG_ENV}={cfg_path}): {exc!r}"
         ) from exc
     _ACTIVATED = True
+    _ACTIVATED_CONFIG = cfg_path
     # Logging is not configured yet in every process that loads plugins.
     print(
         f"[Foundry] sglang plugin active: pid={os.getpid()} config={cfg_path}",
         file=sys.stderr,
         flush=True,
     )
+
+
+def check_config_unchanged() -> None:
+    """Launcher spawn sites: sglang loads plugins once per process, so the
+    mode, the resolution hooks and the preload environment stay those of the
+    config this process activated with. Schedulers activate from the variable
+    they inherit; a later engine started after it changed (or was unset)
+    would mix the two."""
+    current = os.environ.get(CONFIG_ENV)
+    if _ACTIVATED_CONFIG is not None and current != _ACTIVATED_CONFIG:
+        raise RuntimeError(
+            f"[Foundry] {CONFIG_ENV} is {current!r}, but this process activated Foundry with "
+            f"{_ACTIVATED_CONFIG!r}: sglang loads plugins once per process, so a later engine "
+            "keeps the first config's mode, resolution hooks and preload environment. Start "
+            "each engine with another config, or a native engine, in a new process."
+        )
 
 
 def use_flag_labels(flag: str = "--cuda-graph-persistence") -> None:
@@ -294,6 +314,59 @@ def reject_unsupported_features(server_args: Any) -> None:
         unsupported.append("LoRA (--enable-lora / --lora-paths): not persisted or tested")
     if getattr(cfg, "enable_pdmux", False):
         unsupported.append("PD multiplexing (--enable-pdmux): multi-stream graphs")
+    if getattr(cfg, "use_ray", False):
+        unsupported.append(
+            "Ray scheduler actors (--use-ray): Foundry's preload environment and plugin do not "
+            "reach them, so SAVE would write no archive and LOAD would capture natively"
+        )
+    if getattr(cfg, "weight_cache_mode", "off") not in (None, "off"):
+        unsupported.append(
+            f"the weight cache (--weight-cache-mode {cfg.weight_cache_mode}): the parameters "
+            "are CUDA IPC mappings of the daemon's memory at addresses the driver picks per "
+            "process, outside the allocation region"
+        )
+    host_memory = []
+    if getattr(cfg, "enable_hisparse", False):
+        host_memory.append("--enable-hisparse (host KV pool)")
+    engram = _engram_host_tables(server_args, cfg)
+    if engram:
+        host_memory.append(engram)
+    if getattr(cfg, "ple_offload_embedding", False):
+        host_memory.append(
+            "--ple-offload-embedding (on by default for BF16 Qwen4-Exp on CUDA; disable it with "
+            "--no-ple-offload-embedding)"
+        )
+    if (getattr(cfg, "cpu_offload_gb", 0) or 0) > 0:
+        host_memory.append("--cpu-offload-gb")
+    if (getattr(cfg, "offload_group_size", -1) or -1) > 0:
+        host_memory.append("--offload-group-size")
+    if host_memory:
+        unsupported.append(
+            f"{', '.join(host_memory)}: captured kernels read pinned host memory through "
+            "addresses each process picks anew, which a restored graph would not have"
+        )
+    if getattr(cfg, "enable_torch_compile", False):
+        unsupported.append(
+            "--enable-torch-compile: Foundry pins TORCHDYNAMO_DISABLE=1, so the compiled "
+            "batch sizes would capture sglang's uncompiled reference ops"
+        )
+    if (
+        str(getattr(cfg, "disaggregation_mode", "") or "").lower() in ("prefill", "decode")
+        and str(getattr(cfg, "disaggregation_transfer_backend", "") or "").lower() == "mooncake"
+        and (
+            _normalize_env(os.environ.get("MC_INTRANODE_NVLINK", "")) == "1"
+            or os.environ.get("SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "").upper() == "INTRA_NODE_NVLINK"
+        )
+    ):
+        unsupported.append(
+            "Mooncake's intra-node NVLink transport for PD disaggregation: it exports the KV "
+            "pool, which is Foundry region memory, through CUDA IPC handles a process without "
+            "Foundry's hook cannot open; use the RDMA protocol"
+        )
+    if getattr(cfg, "is_embedding", False):
+        unsupported.append(
+            "embedding models (--is-embedding): sglang captures no CUDA graphs for them"
+        )
     max_ep = getattr(cfg, "max_ep_size", None)
     if (
         getattr(cfg, "elastic_ep_backend", None) is not None
@@ -305,7 +378,7 @@ def reject_unsupported_features(server_args: Any) -> None:
             f"elastic-EP CUDA-graph recapture (--elastic-ep-backend with --max-ep-size={max_ep} "
             f"> tp size {cfg.tp_size}): graphs recaptured after a scale event cannot be restored"
         )
-    if os.environ.get("SGLANG_ENABLE_POST_CAPTURE_KV_SIZING", "").lower() in ("1", "true"):
+    if _normalize_env(os.environ.get("SGLANG_ENABLE_POST_CAPTURE_KV_SIZING", "")) == "1":
         unsupported.append(
             "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING: the KV pool is re-sized from post-capture "
             "free memory, which LOAD cannot reproduce"
@@ -586,6 +659,66 @@ def validate_pinned_fields(server_args: Any) -> None:
         raise ValueError(f"not supported with {_FLAG}: " + "; ".join(errors))
 
 
+def _engram_host_tables(server_args: Any, cfg: Any) -> str | None:
+    """Why DeepSeek-V4.1's Engram tables would be in host memory, or None."""
+    if hasattr(server_args, "engram_config"):
+        # sglang with --engram-config: _resolve_engram_config (DeepSeek-V4.1 only;
+        # it runs before this step) folds the deprecated variables into the
+        # declared value, the only one the Engram layers read.
+        if _engram_placement(cfg) == "cpu":
+            return "Engram tables in host memory (--engram-config placement cpu)"
+        return None
+    # Older sglang: the Engram layers read the variable; peer shards (from
+    # 79701a2549) take precedence with TP > 1 on CUDA. Both as sglang parses them.
+    host_table = _sglang_env_flag("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE")
+    if host_table is None:
+        host_table = (
+            _normalize_env(os.environ.get("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE", "")) == "1"
+        )
+    if not host_table:
+        return None
+    if (
+        _sglang_env_flag("SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS")
+        and (getattr(cfg, "tp_size", 1) or 1) > 1
+    ):
+        return None
+    try:
+        from sglang.srt.arg_groups.model_override_base import model_config_of
+
+        if not model_config_of(server_args).use_engram:
+            return None
+    except Exception:
+        pass  # model not known here: keep the refusal
+    return "Engram tables in host memory (SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1)"
+
+
+def _sglang_env_flag(name: str) -> bool | None:
+    """The value sglang reads for the boolean variable ``name`` (its EnvBool:
+    true/1/yes/y, an invalid spelling reads as the default), or None when the
+    installed sglang does not define it."""
+    try:
+        from sglang.srt.environ import envs
+
+        field = getattr(envs, name, None)
+        return None if field is None else bool(field.get())
+    except Exception:
+        return None
+
+
+def _engram_placement(cfg: Any) -> str | None:
+    """The resolved --engram-config placement (a config object, a dict or its
+    JSON string), or None."""
+    value = getattr(cfg, "engram_config", None)
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        return value.get("placement")
+    return getattr(value, "placement", None)
+
+
 def _normalize_env(value: str) -> str:
     v = value.strip().lower()
     if v in ("0", "false", "no", "n", "off"):
@@ -632,6 +765,11 @@ def apply_env_pins(server_args: Any = None) -> None:
             _pin_log(f"{pin.name}={pin.value} (was unset): {pin.reason}")
         elif _normalize_env(current) != pin.value:
             errors.append(f"{pin.name}={current!r} (Foundry needs {pin.value}): {pin.reason}")
+        elif current != pin.value:
+            # Same meaning in another spelling ("off", " 0", "true"): written in
+            # the canonical form, which every consumer's parser reads alike.
+            os.environ[pin.name] = pin.value
+            _pin_log(f"{pin.name}={pin.value} (was {current!r}): {pin.reason}")
         elif (first or pin is NCCL_CUMEM_PIN) and pin.name not in _KEPT_LOGGED:
             _KEPT_LOGGED.add(pin.name)
             _pin_log(f"{pin.name}={pin.value} (already set): {pin.reason}")

@@ -128,9 +128,18 @@ def test_env_pins_are_idempotent_and_quiet_in_descendants(clean_pin_env, capsys)
 
 
 def test_env_pin_already_set_to_the_pinned_value_is_kept(clean_pin_env):
-    os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "false"
+    os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
     plugin.apply_env_pins()
-    assert os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] == "false"
+    assert os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] == "0"
+
+
+@pytest.mark.parametrize("spelling", ["false", "off", " 0", "No"])
+def test_env_pin_in_another_spelling_is_written_canonically(clean_pin_env, spelling):
+    """sglang's EnvBool reads "off" or " 0" as invalid and falls back to its
+    default; the pin is rewritten as "0", which every parser reads alike."""
+    os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = spelling
+    plugin.apply_env_pins()
+    assert os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] == "0"
 
 
 @pytest.mark.parametrize("pin", plugin.ENV_PINS, ids=lambda pin: pin.name)
@@ -197,11 +206,45 @@ def test_supported_record_passes(restore_environ):
         (dict(enable_lora=True), "LoRA"),
         (dict(lora_paths=["a=/x"]), "LoRA"),
         (dict(enable_pdmux=True), "pdmux"),
+        (dict(is_embedding=True), "embedding models"),
+        (dict(use_ray=True), "Ray scheduler actors"),
+        (dict(weight_cache_mode="daemon"), "weight cache"),
+        (dict(enable_hisparse=True), "pinned host memory"),
+        (dict(engram_config={"placement": "cpu"}), "Engram tables in host memory"),
+        (dict(engram_config='{"placement": "cpu"}'), "Engram tables in host memory"),
+        (dict(ple_offload_embedding=True), "disable it with --no-ple-offload-embedding"),
+        (dict(cpu_offload_gb=4), "cpu-offload-gb"),
+        (dict(offload_group_size=2), "offload-group-size"),
+        (dict(enable_torch_compile=True), "enable-torch-compile"),
     ],
 )
 def test_unsupported_features_are_rejected(restore_environ, overrides, match):
     with pytest.raises(ValueError, match=match):
         plugin.reject_unsupported_features(_ns(**overrides))
+
+
+def test_host_memory_and_ipc_transports_from_the_environment_are_rejected(restore_environ):
+    """The deprecated Engram host-table switch and Mooncake's intra-node NVLink
+    PD transport come from the environment."""
+    for name in (
+        "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING",
+        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE",
+        "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS",
+        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL",
+        "MC_INTRANODE_NVLINK",
+    ):
+        os.environ.pop(name, None)
+    plugin.reject_unsupported_features(_ns(engram_config={"placement": "gpu"}))
+    os.environ["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"] = "true"
+    with pytest.raises(ValueError, match="SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1"):
+        plugin.reject_unsupported_features(_ns())
+    del os.environ["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"]
+    pd = _ns(disaggregation_mode="decode", disaggregation_transfer_backend="mooncake")
+    plugin.reject_unsupported_features(pd)
+    os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "INTRA_NODE_NVLINK"
+    with pytest.raises(ValueError, match="intra-node NVLink"):
+        plugin.reject_unsupported_features(pd)
+    plugin.reject_unsupported_features(_ns())  # without a PD role
 
 
 def test_elastic_recapture_is_rejected_where_the_path_exists(restore_environ):
@@ -215,7 +258,51 @@ def test_elastic_recapture_is_rejected_where_the_path_exists(restore_environ):
         plugin.reject_unsupported_features(ns)
 
 
-def test_post_capture_kv_sizing_is_rejected(restore_environ):
-    os.environ["SGLANG_ENABLE_POST_CAPTURE_KV_SIZING"] = "1"
+@pytest.mark.parametrize("value", ["1", "true", "yes", "Y"])
+def test_post_capture_kv_sizing_is_rejected(restore_environ, value):
+    """Every spelling sglang's EnvBool reads as true."""
+    os.environ["SGLANG_ENABLE_POST_CAPTURE_KV_SIZING"] = value
     with pytest.raises(ValueError, match="POST_CAPTURE_KV_SIZING"):
         plugin.reject_unsupported_features(_ns())
+
+
+def test_engram_host_table_variable_counts_only_where_sglang_reads_it(restore_environ, monkeypatch):
+    """With --engram-config, sglang folds the deprecated variable into the
+    resolved value (DeepSeek-V4.1 only), so only that value counts. Older
+    sglang reads the variable in the Engram layers, where peer shards (TP > 1)
+    take precedence and a model without Engram layers creates no table."""
+    from sglang.srt.arg_groups import model_override_base
+
+    for name in ("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE", "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS"):
+        os.environ.pop(name, None)
+    os.environ["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"] = "1"
+    plugin.reject_unsupported_features(_ns(engram_config={"placement": "gpu"}))
+    plugin.reject_unsupported_features(_ns(engram_config=None))
+    with pytest.raises(ValueError, match="placement cpu"):
+        plugin.reject_unsupported_features(_ns(engram_config={"placement": "cpu"}))
+
+    def engram_layers(present):
+        monkeypatch.setattr(
+            model_override_base, "model_config_of", lambda sa: SimpleNamespace(use_engram=present)
+        )
+
+    engram_layers(False)
+    plugin.reject_unsupported_features(_ns())
+    engram_layers(True)
+    with pytest.raises(ValueError, match="SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1"):
+        plugin.reject_unsupported_features(_ns())
+    os.environ["SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS"] = "1"
+    plugin.reject_unsupported_features(_ns(tp_size=4))
+    with pytest.raises(ValueError, match="SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1"):
+        plugin.reject_unsupported_features(_ns(tp_size=1))
+    # sglang's EnvBool reads "on" as invalid (the default, off): host tables.
+    os.environ["SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS"] = "on"
+    with pytest.raises(ValueError, match="SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1"):
+        plugin.reject_unsupported_features(_ns(tp_size=4))
+    # An sglang without the peer-shard variable (before 79701a2549) ignores it.
+    from sglang.srt import environ
+
+    os.environ["SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS"] = "1"
+    monkeypatch.setattr(environ, "envs", SimpleNamespace())
+    with pytest.raises(ValueError, match="SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1"):
+        plugin.reject_unsupported_features(_ns(tp_size=4))

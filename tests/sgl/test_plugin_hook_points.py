@@ -40,6 +40,17 @@ _HOOK_POINTS = [
         ["self"],
     ),
     (
+        # Weights load on the scheduler thread (the wrapper passes every argument through).
+        "sglang.srt.model_executor.model_runner",
+        "ModelRunner.load_model",
+        ["self"],
+    ),
+    (
+        "sglang.srt.model_loader.utils",
+        "should_async_load",
+        ["weight"],
+    ),
+    (
         "sglang.srt.model_executor.model_runner",
         "ModelRunner.alloc_memory_pool",
         # draft_parallel_layout (keyword-only, upstream #46290): draft workers only;

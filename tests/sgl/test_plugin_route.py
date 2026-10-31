@@ -193,6 +193,7 @@ def test_launcher_hook_sets_every_env_pin(tmp_path, clean_pin_env, capsys):
     fake_hooks = SimpleNamespace(install=lambda path: None)
     with (
         mock.patch.object(plugin, "_ACTIVATED", False),
+        mock.patch.object(plugin, "_ACTIVATED_CONFIG", None),
         mock.patch.object(plugin, "register_resolution_hooks"),
         mock.patch.dict(sys.modules, {"foundry.integration.sglang.hooks": fake_hooks}),
     ):
@@ -209,3 +210,45 @@ def test_launcher_hook_sets_every_env_pin(tmp_path, clean_pin_env, capsys):
 def test_nccl_cumem_is_pinned_by_resolution(model_dir, plugin_hooks):
     _resolve(model_dir)
     assert os.environ[plugin.NCCL_CUMEM_PIN.name] == "0"
+
+
+# ---------------------------------------------------------------------------
+# Launcher spawn site
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_refuses_a_record_resolved_without_the_plugin(model_dir, restore_environ):
+    """A record resolved before the plugin loaded (HttpServerEngineAdapter: the
+    parent resolves, the child loads plugins after its no-op resolve_once)
+    carries none of Foundry's pins; the spawn site refuses it, also when its
+    graph config is one Foundry accepts (prefill disabled, on any host)."""
+    from foundry.integration.sglang import hooks
+
+    with mock.patch.dict(resolution_hooks._HOOKS, clear=True):
+        sa = _resolve(model_dir, cuda_graph_backend_prefill=Backend.DISABLED)
+    cfg = resolution_result(sa, "cuda_graph_config")
+    assert (cfg.decode.backend, cfg.prefill.backend) == (Backend.FULL, Backend.DISABLED)
+    with pytest.raises(RuntimeError, match="pins and refusals did not run"):
+        hooks._check_resolved_graph_config(sa)
+
+
+def test_spawn_accepts_a_record_resolved_with_the_plugin(model_dir, plugin_hooks):
+    from foundry.integration.sglang import hooks
+
+    hooks._check_resolved_graph_config(_resolve(model_dir))
+
+
+def test_spawn_refuses_a_config_changed_after_activation(restore_environ):
+    """sglang loads plugins once per process: a later engine started under
+    another (or no) config would keep the first one's mode and pins."""
+    with mock.patch.object(plugin, "_ACTIVATED_CONFIG", "/cfg/load.toml"):
+        os.environ[plugin.CONFIG_ENV] = "/cfg/load.toml"
+        plugin.check_config_unchanged()
+        os.environ[plugin.CONFIG_ENV] = "/cfg/save.toml"
+        with pytest.raises(RuntimeError, match="activated Foundry with '/cfg/load.toml'"):
+            plugin.check_config_unchanged()
+        del os.environ[plugin.CONFIG_ENV]
+        with pytest.raises(RuntimeError, match="is None"):
+            plugin.check_config_unchanged()
+    with mock.patch.object(plugin, "_ACTIVATED_CONFIG", None):
+        plugin.check_config_unchanged()

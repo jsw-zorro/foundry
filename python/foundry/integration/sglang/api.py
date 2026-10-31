@@ -18,7 +18,9 @@ The major number changes when a function below is removed or changes its
 signature or its call-site contract; the minor number when one is added.
 2.0 is the contract below: every call site passes values (the model, the
 draft flag, the pool config, the prefill request-slot count once per prefill
-capture scope), never a runner or backend object.
+capture scope), never a runner or backend object. 2.1 adds the attention
+backend's ``post_warmup_hook`` to :func:`capture_one` (the warm-up forward runs
+only when the adapter passes it).
 
 Call sites (SGLang side, in process order):
 
@@ -56,7 +58,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-INTEGRATION_API_VERSION = (2, 0)
+INTEGRATION_API_VERSION = (2, 1)
 MODES = ("save", "load")
 FLAG = "--cuda-graph-persistence"
 
@@ -295,13 +297,24 @@ def capture_scope(phase: str, *, model: Any, req_slots: int | None = None):
     return hooks.capture_scope(phase, model, req_slots)
 
 
-def capture_one(shape_key: Any, forward_fn, *, pool: Any, stream: Any):
+_UNSET = object()
+
+
+def capture_one(
+    shape_key: Any, forward_fn, *, pool: Any, stream: Any, post_warmup_hook: Any = _UNSET
+):
     """Replaces the body of ``FullCudaGraphBackend.capture_one`` (inside a
     :func:`capture_scope`) and returns ``(graph, output)`` for SGLang to
-    store: SAVE captures the shape on ``stream`` into ``pool`` without warm-up
-    forwards and archives it; LOAD restores the archived graph and runs no
-    forward."""
+    store: SAVE captures the shape on ``stream`` into ``pool`` and archives
+    it; LOAD restores the archived graph. ``post_warmup_hook`` (2.1, the
+    attention backend's ``on_after_cuda_graph_warmup`` or None): with it, each
+    capture scope's first shape first runs one eager warm-up forward on both
+    modes; an adapter that does not pass it runs without the warm-up."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    return hooks.capture_one(shape_key, forward_fn, pool=pool, stream=stream)
+    if post_warmup_hook is _UNSET:
+        return hooks.capture_one(shape_key, forward_fn, pool=pool, stream=stream)
+    return hooks.capture_one(
+        shape_key, forward_fn, pool=pool, stream=stream, post_warmup_hook=post_warmup_hook
+    )

@@ -18,6 +18,36 @@ class CUDAGraphExtensionMode(str, enum.Enum):
     LOAD = "load"
 
 
+# Per-rank archive records LOAD reads before anything else (runtime.py; the
+# preflight reads them too, without torch).
+# region_layout.json: the deterministic allocation layout, written at the end
+# of SAVE and consumed by LOAD's preallocation (runtime.record_region_layout).
+ARCHIVE_LAYOUT_FILE = "region_layout.json"
+# fingerprint.json: what SAVE ran with (runtime.archive_fingerprint).
+ARCHIVE_FINGERPRINT_FILE = "fingerprint.json"
+# Per SAVE run, in both files: LOAD refuses a rank directory whose files come
+# from different runs (two engines writing one workspace_root).
+ARCHIVE_SAVE_ID_KEY = "save id"
+# Version of the allocation sequence between the layout start and the end of
+# the decode capture, recorded in region_layout.json on SAVE and required on
+# LOAD. 2: both modes run sglang's own decode capture loop and substitute only
+# the capture (1, unmarked: a FlashInfer metadata pre-pass before the loop,
+# which allocates the per-bs wrappers in another order; LOAD cannot replay it).
+# 3: one eager warm-up forward at each capture scope's first shape on both
+# modes (hooks._warm_up_first_shape); every record LOAD checks (fingerprint,
+# scratch boundary, offset trail) is required.
+CAPTURE_LOOP_VERSION = 3
+
+
+def _toml_bool(data: dict, key: str, default: bool) -> bool:
+    """A TOML boolean (``true`` / ``false``); a string such as ``"false"``
+    would otherwise read as True."""
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise TypeError(f"Foundry config: {key} must be true or false, got {value!r}")
+    return value
+
+
 @dataclass
 class CUDAGraphExtensionConfig:
     mode: CUDAGraphExtensionMode = CUDAGraphExtensionMode.NONE
@@ -30,7 +60,7 @@ class CUDAGraphExtensionConfig:
     # leaves LD_PRELOAD as the launcher exported it.
     verbs_udev_wait_shim_path: str | None = None
     base_addr: int = 0x600000000000
-    region_size: str = "64GB"
+    region_size: str = "256GB"
     workspace_root: str = "foundry_archive"
     workspace_dir: str | None = None
     scratch_space_size: str = "64MB"
@@ -55,6 +85,14 @@ class CUDAGraphExtensionConfig:
         hook_library_path = data.get("hook_library_path")
         if hook_library_path is None:
             hook_library_path = cls._detect_hook_so_path()
+        elif "/" in hook_library_path and not Path(hook_library_path).is_file():
+            # ld.so ignores a missing LD_PRELOAD entry with a warning only, and
+            # every buffer would then get a driver-chosen address (a bare name
+            # is resolved through the loader's search path).
+            raise FileNotFoundError(
+                f"hook_library_path={hook_library_path!r} in {source} does not exist; "
+                "omit it to use the installed foundry's libcuda_hook.so"
+            )
 
         nvshmem_host_path = data.get("nvshmem_host_path")
         if nvshmem_host_path is None:
@@ -77,7 +115,7 @@ class CUDAGraphExtensionConfig:
             region_size=data.get("region_size", cls.region_size),
             workspace_root=data.get("workspace_root", cls.workspace_root),
             scratch_space_size=data.get("scratch_space_size", cls.scratch_space_size),
-            graph_templates=bool(data.get("graph_templates", cls.graph_templates)),
+            graph_templates=_toml_bool(data, "graph_templates", cls.graph_templates),
         )
 
     @staticmethod

@@ -33,6 +33,7 @@ recipe/sglang/README.md shows how to run it by hand.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -242,6 +243,59 @@ def check_plugin_allowlist(env: Mapping[str, str]) -> str:
     return f"SGLANG_PLUGINS={raw!r} includes {ENTRY_POINT_NAME}"
 
 
+def _loader_resolves(name: str, cwd: Path | None = None) -> bool | None:
+    """Whether ld.so finds a bare library name given in LD_PRELOAD to this
+    interpreter, which the schedulers run, started in ``cwd``: its RPATH /
+    RUNPATH, LD_LIBRARY_PATH (relative and empty elements are relative to the
+    working directory), ld.so.cache and the system directories. ld.so's list
+    mode (what ldd runs) maps the objects and exits before any constructor or
+    the program runs, so the hook intercepts nothing here. None when the probe
+    gave no list."""
+    env = dict(os.environ, LD_PRELOAD=name, LD_TRACE_LOADED_OBJECTS="1")
+    try:
+        out = subprocess.run(
+            [sys.executable], env=env, cwd=cwd, capture_output=True, text=True, timeout=60
+        )
+    except Exception:
+        return None
+    lines = [line.strip() for line in out.stdout.splitlines()]
+    if not any(" (0x" in line for line in lines):
+        return None
+    # "<name> => <path> (0x...)", or "<name> (0x...)" when ld.so opened the
+    # name as given (an empty LD_LIBRARY_PATH element: the working directory).
+    return any(
+        line.startswith(f"{name} (0x")
+        or (line.startswith(f"{name} => ") and not line.startswith(f"{name} => not found"))
+        for line in lines
+    )
+
+
+def _rank_archive_problem(rank_dir: Path) -> str | None:
+    """The records LOAD reads first, checked as LOAD checks them (setup)."""
+    from foundry.integration.sglang.config import (
+        ARCHIVE_FINGERPRINT_FILE,
+        ARCHIVE_LAYOUT_FILE,
+        ARCHIVE_SAVE_ID_KEY,
+        CAPTURE_LOOP_VERSION,
+    )
+
+    try:
+        with open(rank_dir / ARCHIVE_LAYOUT_FILE) as f:
+            layout = json.load(f)
+        with open(rank_dir / ARCHIVE_FINGERPRINT_FILE) as f:
+            fingerprint = json.load(f)
+    except FileNotFoundError as exc:
+        return f"{Path(exc.filename).name} not found (the SAVE did not complete)"
+    except ValueError as exc:
+        return f"unreadable record ({exc})"
+    version = layout.get("capture_loop_version")
+    if version != CAPTURE_LOOP_VERSION:
+        return f"capture_loop_version={version}, this Foundry needs {CAPTURE_LOOP_VERSION}"
+    if layout.get(ARCHIVE_SAVE_ID_KEY) != fingerprint.get(ARCHIVE_SAVE_ID_KEY):
+        return "fingerprint.json and region_layout.json come from different SAVE runs"
+    return None
+
+
 def check_toml(toml: str, expect_mode: str | None, cwd: Path, flag_mode: bool = False) -> str:
     """``flag_mode``: the dependency route, where ``expect_mode`` comes from
     ``--cuda-graph-persistence`` and replaces the TOML's ``mode``."""
@@ -268,10 +322,17 @@ def check_toml(toml: str, expect_mode: str | None, cwd: Path, flag_mode: bool = 
         raise PreflightError(f"Foundry TOML {path} has mode = {mode!r}, expected {expect_mode!r}")
     if mode not in ("save", "load"):
         raise PreflightError(f"Foundry TOML {path} has mode = {mode!r}: use 'save' or 'load'")
-    if cfg.hook_library_path is None or not Path(cfg.hook_library_path).is_file():
+    if cfg.hook_library_path is None:
         raise PreflightError(
             "libcuda_hook.so not found next to foundry.ops (the native build is incomplete): "
             f"{INSTALL_HINT}"
+        )
+    hook = cfg.hook_library_path
+    if "/" not in hook and _loader_resolves(hook, cwd) is False:
+        raise PreflightError(
+            f"hook_library_path = {hook!r} in {path} is not found by ld.so for {sys.executable} "
+            f"started in {cwd} (its RPATH/RUNPATH, LD_LIBRARY_PATH, ld.so.cache, the system "
+            "directories): give an absolute path"
         )
     archive = Path(cfg.workspace_root)
     if not archive.is_absolute():
@@ -285,6 +346,10 @@ def check_toml(toml: str, expect_mode: str | None, cwd: Path, flag_mode: bool = 
         ranks = sorted(p.name for p in archive.glob("rank_*") if p.is_dir())
         if not ranks:
             raise PreflightError(f"LOAD archive {archive} has no rank_* dirs: run --save first")
+        for rank in ranks:
+            problem = _rank_archive_problem(archive / rank)
+            if problem:
+                raise PreflightError(f"LOAD archive {archive / rank}: {problem}: re-SAVE")
         return f"TOML {path} mode=load, archive {archive} ({len(ranks)} rank dirs)"
     note = ""
     if archive.exists():

@@ -37,7 +37,9 @@ _SECTION_STRING_TABLE = 0
 _SECTION_NODE_TABLE = 1
 _SECTION_KERNEL_PARAM_INDEX = 3
 _SECTION_KERNEL_PARAM_DATA = 4
+_SECTION_ARG_BUFFER_DATA = 5
 _SECTION_ALLOCATOR_EVENTS = 8
+_NO_ARG_BUFFER = 0xFFFFFFFF
 _NODE_ENTRY_SIZE = 168
 _NODE_KERNEL = 0
 _NODE_MEMSET = 1
@@ -66,6 +68,7 @@ def _iter_nodes(n_nodes: int, sections: dict):
     strings = sections.get(_SECTION_STRING_TABLE, b"")
     pidx = sections.get(_SECTION_KERNEL_PARAM_INDEX, b"")
     pdata = sections.get(_SECTION_KERNEL_PARAM_DATA, b"")
+    abuf = sections.get(_SECTION_ARG_BUFFER_DATA, b"")
     for i in range(n_nodes):
         entry = nodes[_NODE_ENTRY_SIZE * i : _NODE_ENTRY_SIZE * (i + 1)]
         _node_id, ntype = struct.unpack_from("<IB", entry, 0)
@@ -73,11 +76,22 @@ def _iter_nodes(n_nodes: int, sections: dict):
         if ntype == _NODE_KERNEL:
             fn_off, fn_len = struct.unpack_from("<II", body, 36)
             pio, npar = struct.unpack_from("<II", body, 120)
+            ab_off, ab_size = struct.unpack_from("<II", body, 128)
             name = strings[fn_off : fn_off + fn_len].decode(errors="replace")
             params = []
-            for j in range(npar):
-                doff, size = struct.unpack_from("<II", pidx, pio + 8 * j)
-                params.append(pdata[doff : doff + size])
+            if ab_off != _NO_ARG_BUFFER:
+                # Launched through 'extra' (e.g. NCCL): the parameter entries are
+                # offsets into this node's argument buffer.
+                arg_buffer = abuf[ab_off : ab_off + ab_size]
+                for j in range(npar):
+                    doff, size = struct.unpack_from("<II", pidx, pio + 8 * j)
+                    params.append(arg_buffer[doff : doff + size])
+                if not params:
+                    params.append(arg_buffer)
+            else:
+                for j in range(npar):
+                    doff, size = struct.unpack_from("<II", pidx, pio + 8 * j)
+                    params.append(pdata[doff : doff + size])
             yield "kernel", name, params
         elif ntype == _NODE_MEMSET:
             (dst,) = struct.unpack_from("<Q", body, 0)
@@ -136,7 +150,16 @@ def check_rank_archive(rank_dir: str, region_base: int, region_size: int) -> dic
     live = []
     if os.path.exists(layout_path):
         with open(layout_path) as f:
-            live = [(region_base + int(o), int(n)) for o, n in json.load(f).get("live_ranges", [])]
+            layout = json.load(f)
+        live = [(region_base + int(o), int(n)) for o, n in layout.get("live_ranges", [])]
+        # Reservations carved from the region before the layout start (torch symmetric
+        # memory, multicast, NCCL cuMem buffers): LOAD makes them at the same offsets.
+        live += [(region_base + int(o), int(n)) for o, n in layout.get("reserved_ranges", [])]
+        live += [
+            (region_base + int(o), int(n))
+            for kind, o, n in layout.get("scratch_live_ranges") or []
+            if kind == "r"
+        ]
     live_ranges = _Ranges(live)
     region_end = region_base + region_size
     findings: dict = collections.defaultdict(lambda: {"nodes": 0, "targets": set()})

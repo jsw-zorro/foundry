@@ -15,7 +15,7 @@ serve settings of the recipes in recipe/sglang/. Assertions:
       RESTORE_RATIO x the native decode capture ("Capture ... graph end ... elapsed=Xs", max over ranks);
   (d) Foundry active in the launcher and every scheduler, no "[HOOK] ERROR";
   (e) SAVE wrote one archive directory per rank, and SAVE final_alloc_offset == LOAD after_load_all_graphs per rank;
-      distributed init stayed inside the scratch space and LOAD's cursor met SAVE's layout start.
+      distributed init stayed inside the scratch space, and the restore never moved LOAD's cursor up to a graph's start.
 
 Cases (args copied from the recipe lines cited in CASES; a recipe change must show up here):
   q35_tp2 / q35_ep2 / q35_tpep2   Qwen3.5-35B-A3B on 2 GPUs (serve_qwen3.5-35ba3b.sh), real weights
@@ -24,6 +24,10 @@ Cases (args copied from the recipe lines cited in CASES; a recipe change must sh
   q35_122b_fp8_ep4                Qwen3.5-122B-A10B-FP8 ep4 (serve_qwen3.5-122ba10b.sh), xlarge, dummy weights
   q3_30b_tp2pp2                   Qwen3-30B-A3B, 2 pipeline stages x TP2, xlarge, dummy weights
   dsv4_flash_fp8_ep4              DeepSeek-V4-Flash-FP8 ep4 (serve_deepseek-v4-flash.sh), xlarge, dummy weights
+  phi3_rope96 / q25vl_mrope       1 GPU, real weights: RoPE caches converted on the first forward
+                                  (head size 96; mrope)
+  q35_tp2ep2_std                  Qwen3.5-35B-A3B TP2 + EP2 without an all-to-all backend (local expert
+                                  map built on the first forward), real weights
 Native, SAVE and LOAD all run with the variables of recipe/sglang/set_env.sh (a value
 already exported wins, as there), plus NCCL_CUMEM_ENABLE=0 and NCCL_NVLS_ENABLE=0.
 
@@ -254,6 +258,19 @@ CASES = [
           _ep(4) + _DEEPEP + ["--chunked-prefill-size", "2048", "--max-running-requests", "1024"],
           _decode_max(MAXBS), memfrac=0.7, weights="dummy",
           env={**_EP_ENV, "SGLANG_DSV4_FP4_EXPERTS": "0"}, marks=pytest.mark.xlarge),
+    # State a model builds lazily on its first forward, which a capture without warm-up would put
+    # into the first captured graph only: the RoPE cos/sin cache converted to the activation dtype
+    # (head size 96: sglang's fallback rotary kernel; mrope), and the local expert map of EP
+    # without an all-to-all backend. Real weights: dummy ones give these models uniform logits,
+    # whose greedy tokens do not depend on the values that would be wrong.
+    _case("phi3_rope96", "microsoft/Phi-3-mini-4k-instruct", 1, [], _decode_max(MAXBS),
+          memfrac=0.8, weights="real"),
+    _case("q25vl_mrope", "Qwen/Qwen2.5-VL-3B-Instruct", 1, [], _decode_max(MAXBS),
+          memfrac=0.8, weights="real"),
+    _case("q35_tp2ep2_std", _Q35, 2,
+          ["--tp-size", "2", "--ep-size", "2", "--chunked-prefill-size", "256",
+           "--attention-backend", "fa3", "--max-running-requests", "512"],
+          _decode_max(MAXBS), memfrac=0.8, weights="real"),
 ]  # fmt: skip
 
 
@@ -418,9 +435,10 @@ def test_save_then_load_multigpu(case, tmp_path):
         load_offsets,
     )
     assert "more than scratch_space_size" not in save["log"], "distributed init overran the scratch"
-    assert "LOAD cursor" not in load["log"], (
-        "LOAD allocated differently from SAVE before the restore"
-    )
+    # A LOAD cursor off SAVE's layout start stops LOAD; within the restore the hook moves a
+    # lagging cursor up to a graph's recorded start, which no case here should need (no graph
+    # holds a generator state).
+    assert "cursor moved up" not in load["log"], "LOAD allocated less than SAVE between two graphs"
 
     # (a)
     for name, run in (("native", native), ("SAVE", save), ("LOAD", load)):

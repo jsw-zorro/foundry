@@ -13,6 +13,7 @@ import functools
 import gc
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import asdict
@@ -137,8 +138,7 @@ def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> No
     rt.setup_graph_extension(server_args, tp_rank=tp_rank, pp_rank=pp_rank, dp_rank=dp_rank)
     rt.log_alloc_offset("after_setup_graph_ext")
     if mode == CUDAGraphExtensionMode.LOAD:
-        rt.check_capture_loop_version()
-        rt.check_archive_fingerprint(server_args)
+        # (setup_graph_extension checked the archive's version and fingerprint.)
         # Grow the driver's graph-exec memory now, on a background thread,
         # so Phase 2's instantiates at the capture point reuse it (see
         # graph_ops.start_exec_pool_prewarm).
@@ -213,6 +213,7 @@ def after_runner_distributed_init(is_draft_worker: bool) -> None:
         and rt.get_state() is not None
     ):
         _after_runner_distributed_init()
+        _synchronous_weight_loading(True)
 
 
 # Context overrides the memory-pool resolver issued on SAVE
@@ -327,6 +328,8 @@ def _begin_graph_layout(model, mode) -> None:
         raise RuntimeError("Foundry SGLang state is not initialized")
     if state.layout_started:
         return
+    _synchronous_weight_loading(False)
+    rt.check_model_tensors_in_region(model)
 
     # Pre-capture bootstraps. Everything sglang initializes lazily on the
     # first eager forward that a capturing stream rejects, or that must exist
@@ -400,14 +403,59 @@ _scope: tuple[str, int | None] | None = None
 # completed. A later capture of the same phase is a recapture (see capture_scope).
 _startup_captured: set[str] = set()
 _recapturing = False
+_recapture_bootstrapped = False
+# Capture scopes ("decode", "prefill") whose first shape ran the warm-up forward.
+_warmed_up: set[str] = set()
+# capture_one's post_warmup_hook when the caller passed none: a dependency-route
+# adapter older than integration API 2.1, which runs without the warm-up.
+_NO_WARMUP_HOOK = object()
 
 
-def capture_one(shape_key, forward_fn, *, pool, stream):
+def _warm_up_first_shape(forward_fn, post_warmup_hook) -> None:
+    """One eager forward at a capture scope's first shape, on SAVE and LOAD
+    alike, before that shape's graph is captured or restored. What the model
+    builds lazily on its first forward (a RoPE cos/sin table converted to the
+    activation dtype, the EP dispatcher's local expert map) is then an
+    ordinary allocation at the same address on both modes, with its contents
+    written; captured instead, it would be a node of the first graph only,
+    which the other graphs and eager code read before that graph ever
+    replays. sglang's own capture runs two such forwards before every shape;
+    ``post_warmup_hook`` is the attention backend's reset between them. The
+    forward's transient memory is returned to the driver on both modes (SAVE's
+    live layout then does not hold it, and the hook releases what LOAD mapped
+    for it on demand)."""
+    phase = _scope[0]
+    if phase in _warmed_up:
+        return
+    _warmed_up.add(phase)
+    if post_warmup_hook is _NO_WARMUP_HOOK:
+        logger.warning(
+            "[Foundry] the sglang adapter passes no post_warmup_hook (integration API < 2.1): "
+            "no warm-up forward; state a model creates on its first forward is captured "
+            "into the first graph only"
+        )
+        return
+    import torch
+
+    rt.log_alloc_offset(f"before_{phase}_warmup")
+    torch.cuda.synchronize()
+    out = forward_fn()
+    del out
+    if post_warmup_hook is not None:
+        post_warmup_hook()
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    rt.log_alloc_offset(f"after_{phase}_warmup")
+
+
+def capture_one(shape_key, forward_fn, *, pool, stream, post_warmup_hook=_NO_WARMUP_HOOK):
     """Replaces ``FullCudaGraphBackend.capture_one`` for one shape, SAVE or
     LOAD, inside :func:`capture_scope`; the runner's capture loop around it is
     SGLang's own. Returns ``(graph, output)`` for the caller to store in the
     backend. ``pool`` / ``stream``: the backend's graph pool and capture
-    stream (SAVE)."""
+    stream (SAVE); ``post_warmup_hook``: the attention backend's reset after
+    the warm-up forward of the scope's first shape."""
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         raise RuntimeError("[Foundry] capture_one called without SAVE or LOAD")
@@ -415,12 +463,18 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
         raise RuntimeError("[Foundry] capture_one called outside capture_scope")
     if _recapturing:
         # A recapture after startup: a plain capture, neither archived nor
-        # restored (no warm-up forwards: everything they would initialize
-        # lazily already ran while serving).
+        # restored, without warm-up forwards. The one-time runtime inits that
+        # capture rejects (DeepGEMM's runtime, inductor's pattern matcher) run
+        # first once: a LOAD process restored its graphs and may not have
+        # served a request before the recapture.
+        global _recapture_bootstrapped
         from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
-        from foundry.integration.sglang.graph_ops import capture_graph
+        from foundry.integration.sglang.graph_ops import bootstrap_lazy_runtimes, capture_graph
 
+        if not _recapture_bootstrapped:
+            bootstrap_lazy_runtimes()
+            _recapture_bootstrapped = True
         with graph_pool_capture_scope():
             return capture_graph(pool, stream, forward_fn)
     req_slots = _scope[1]
@@ -433,12 +487,13 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
             f"({shape_key.attention_variant!r}); Foundry save/load does not support "
             "graph variants"
         )
+    _warm_up_first_shape(forward_fn, post_warmup_hook)
     if mode == CUDAGraphExtensionMode.LOAD:
         # LOAD, both runners: the upstream capture loop runs (see
         # capture_scope) and only the capture is replaced, by the archived
         # graph for this shape; its allocator events replay here, at the point
-        # SAVE captured it, after the same per-shape eager work. No forward
-        # runs on LOAD.
+        # SAVE captured it, after the same per-shape eager work. The only
+        # forward LOAD runs is the warm-up of the scope's first shape.
         from foundry.integration.sglang.graph_ops import (
             restore_next_decode_graph,
             restore_next_prefill_graph,
@@ -454,9 +509,10 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
         # ``graph.reset()`` on each.
         return graph, out
 
-    # SAVE: capture directly, no warm-up forwards (their freed activations
-    # would leave cached segments LOAD cannot reproduce). Dynamo is pinned off
-    # (plugin.ENV_PINS), as it refuses to trace inside a capture.
+    # SAVE: capture; besides the first shape's warm-up (which LOAD runs too),
+    # no warm-up forwards (their freed activations would leave cached segments
+    # LOAD cannot reproduce). Dynamo is pinned off (plugin.ENV_PINS), as it
+    # refuses to trace inside a capture.
     from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
     from foundry.integration.sglang.graph_ops import capture_graph, save_graph
@@ -507,11 +563,13 @@ def _prefill_capture_scope(model, req_slots: int):
         yield
         finish_prefill_graph_restore(time.perf_counter() - t_loop)
         rt.log_alloc_offset("after_prefill_restore")
+        rt.log_alloc_offset("prefill_scope_end")
         return
 
     rt.log_alloc_offset("save_before_prefill_capture")
     yield
     rt.log_alloc_offset("save_after_prefill_capture")
+    rt.log_alloc_offset("prefill_scope_end")
     save_prefill_graph_state(
         req_slots=req_slots,
         has_dp_gather=bool(dp_flags.prefill_graph_has_dp_gather),
@@ -532,6 +590,10 @@ def _decode_capture_scope(model):
 
     # No-op when the prefill runner captured first.
     _begin_graph_layout(model, mode)
+    # Same point on both modes, after the decode runner's construction (static
+    # inputs, attention-backend graph state), which with prefill graphs on runs
+    # between the two capture scopes.
+    rt.log_alloc_offset("decode_scope_start")
 
     if mode == CUDAGraphExtensionMode.LOAD:
         import torch
@@ -567,6 +629,7 @@ def _decode_capture_scope(model):
         yield
         finish_decode_graph_restore(time.perf_counter() - t_loop)
         rt.log_alloc_offset("after_load_all_graphs")
+        rt.log_alloc_offset("decode_scope_end")
 
         # Surrender torch-cached-but-free segments so later eager allocations
         # cannot reuse VA ranges that restored graphs may reference internally
@@ -579,6 +642,7 @@ def _decode_capture_scope(model):
 
     # SAVE: the same upstream loop; capture_one captures and saves each graph.
     yield
+    rt.log_alloc_offset("decode_scope_end")
 
     from foundry.integration.sglang.graph_ops import (
         pack_fatbins,
@@ -696,11 +760,58 @@ def _patch_init_parallel_runtime(bootstrap) -> None:
 
     @functools.wraps(orig_runner_init)
     def patched_runner_init(self, *args, **kwargs):
+        if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE and not getattr(
+            self, "is_generation", True
+        ):
+            raise RuntimeError(
+                "[Foundry] SGLang save/load supports generation models only: an embedding, "
+                "reward or classification model runs no decode, and the prefill graphs it may "
+                "capture return pooled outputs Foundry does not archive; serve this model "
+                "without Foundry"
+            )
         result = orig_runner_init(self, *args, **kwargs)
         after_runner_distributed_init(self.is_draft_worker)
         return result
 
     cls.init_torch_distributed = patched_runner_init
+
+
+def _synchronous_load(weight) -> bool:
+    return False
+
+
+_async_load_original = None
+
+
+def _synchronous_weight_loading(enable: bool) -> None:
+    """From the end of distributed init to the layout start (the weight load
+    and the memory pool), on SAVE and LOAD and both routes, every module's
+    binding of sglang's ``should_async_load`` returns False, so weights load
+    on the scheduler thread. sglang's DeepSeek-family loaders hand each CPU
+    weight to a thread pool when it says so; the CUDA temporaries of those
+    workers come from the driver, outside the thread-local allocation region,
+    and post-load processing can then place persistent tensors in their
+    cached segments (runtime._check_tensors_in_region refuses that at the
+    layout start). ``False`` restores the original in every module, the ones
+    imported meanwhile included."""
+    global _async_load_original
+    if enable:
+        try:
+            from sglang.srt.model_loader import utils as loader_utils
+        except ImportError:
+            return
+        original = getattr(loader_utils, "should_async_load", None)
+        if original is None or original is _synchronous_load:
+            return
+        _async_load_original, old, new = original, original, _synchronous_load
+    else:
+        if _async_load_original is None:
+            return
+        old, new = _synchronous_load, _async_load_original
+        _async_load_original = None
+    for module in list(sys.modules.values()):
+        if getattr(module, "should_async_load", None) is old:
+            module.should_async_load = new
 
 
 def _patch_alloc_memory_pool() -> None:
@@ -811,7 +922,11 @@ def _patch_cuda_graph_capture() -> None:
                 post_warmup_hook=post_warmup_hook,
             )
         graph, out = capture_one(
-            shape_key, forward_fn, pool=self._pool, stream=self._capture_stream
+            shape_key,
+            forward_fn,
+            pool=self._pool,
+            stream=self._capture_stream,
+            post_warmup_hook=post_warmup_hook,
         )
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
@@ -894,6 +1009,9 @@ def _patch_spawn_sites() -> None:
         @functools.wraps(orig_launch)
         def patched_launch(cls, *args, **kwargs):
             if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
+                from foundry.integration.sglang.plugin import check_config_unchanged
+
+                check_config_unchanged()
                 server_args = args[0] if args else kwargs.get("server_args")
                 _check_resolved_graph_config(server_args)
                 rt.setup_ld_preload_env(server_args)
@@ -920,10 +1038,12 @@ def _patch_spawn_sites() -> None:
 
 def _check_resolved_graph_config(server_args) -> None:
     """Launcher, before any scheduler is spawned: the record must have been
-    resolved with Foundry's graph pins (decode ``full``, prefill ``full`` or
-    ``disabled``). They are declared by the plugin's resolution hooks; a
-    record resolved before the plugin loaded would otherwise
-    start without them and SAVE / LOAD would disagree with the archive."""
+    resolved with Foundry's resolution hooks, which declare the graph pins
+    (decode ``full``, prefill ``full`` or ``disabled``) and run the field pins
+    and refusals. A record resolved in a process that had not loaded the
+    plugin (sglang's ``HttpServerEngineAdapter`` resolves in the parent and
+    serves from a child; ``resolve_once`` is then a no-op in the child, which
+    loads plugins after it) would otherwise start without any of them."""
     if server_args is None:
         return
     try:
@@ -931,6 +1051,18 @@ def _check_resolved_graph_config(server_args) -> None:
         from sglang.srt.model_executor.cuda_graph_config import Backend
     except ImportError:
         return
+    from foundry.integration.sglang.plugin import RESOLUTION_SOURCE
+
+    declared = {source for source, _ in getattr(server_args, "_resolved_overrides", None) or ()}
+    if getattr(server_args, "_resolution_finished", False) and RESOLUTION_SOURCE not in declared:
+        raise RuntimeError(
+            "[Foundry] the server args were resolved without Foundry's resolution hooks, so "
+            "Foundry's pins and refusals did not run on them. A process that has not loaded "
+            "sglang's plugins resolved the record and passed it on (e.g. sglang's "
+            "HttpServerEngineAdapter, or http_server.launch_server in a child process). Call "
+            "sglang.srt.plugins.load_plugins() before the server args are resolved, or launch "
+            "with sglang serve, python -m sglang.launch_server or sglang.Engine."
+        )
     cfg = resolution_result(server_args, "cuda_graph_config")
     if cfg is None:
         return

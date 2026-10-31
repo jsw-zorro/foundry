@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -39,8 +40,10 @@ _PREFILL_GRAPH_FILENAME_RE = re.compile(
 # flag the captured forwards latch and the prefill output structures.
 _PREFILL_STATE_FILE = "prefill_graphs.json"
 # Per rank: the output structure of each decode graph whose output is not the
-# logits (a non-last pipeline stage returns PPProxyTensors). Absent when every
-# decode graph returns the logits, as in archives saved before it existed.
+# logits alone (a non-last pipeline stage returns PPProxyTensors; with a
+# return-hidden-states mode the LogitsProcessorOutput also carries hidden
+# states). Absent when every decode graph returns only the logits, as in
+# archives saved before it existed.
 _DECODE_STATE_FILE = "decode_graphs.json"
 _decode_output_specs: dict[str, Any] = {}
 # PrefillCudaGraphRunner's only ShapeKey variants (_chunked_prefix_variant).
@@ -146,15 +149,31 @@ def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
 
 def _pack_output(output: Any) -> tuple[Any, Any]:
     """(tensors to save, structure spec) of a decode graph's output: the
-    logits (spec None), or the PPProxyTensors of a non-last pipeline stage
-    (spec ``{"pp": names}``, its tensors in that order)."""
+    logits (spec None); every tensor field of a LogitsProcessorOutput that
+    holds more than the logits, e.g. hidden states under a
+    return-hidden-states mode (spec ``{"lpo": field names}``, the tensors in
+    that order); or the PPProxyTensors of a non-last pipeline stage (spec
+    ``{"pp": names}``)."""
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
     if isinstance(output, LogitsProcessorOutput):
         if output.next_token_logits is None:
             raise TypeError("SGLang decode CUDA graph output has no next_token_logits")
-        return output.next_token_logits, None
+        fields = {}
+        for f in dataclasses.fields(output):
+            value = getattr(output, f.name)
+            if value is None:
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"SGLang decode CUDA graph output field {f.name} is a {type(value).__name__}; "
+                    "Foundry archives tensor fields only"
+                )
+            fields[f.name] = value
+        if list(fields) == ["next_token_logits"]:
+            return output.next_token_logits, None
+        return list(fields.values()), {"lpo": list(fields)}
 
     if isinstance(output, torch.Tensor):
         return output, None
@@ -173,12 +192,14 @@ def _unpack_output(tensors: Any, spec: Any = None) -> Any:
     if isinstance(tensors, torch.Tensor):
         tensors = [tensors]
     if spec is not None:
-        names = spec["pp"]
+        names = spec["lpo"] if "lpo" in spec else spec["pp"]
         if len(tensors) != len(names):
             raise RuntimeError(
                 f"SGLang decode CUDA graph restored {len(tensors)} output tensors, "
                 f"the archive records {len(names)} ({names})"
             )
+        if "lpo" in spec:
+            return LogitsProcessorOutput(**dict(zip(names, tensors, strict=True)))
         return PPProxyTensors(dict(zip(names, tensors, strict=True)))
     if len(tensors) != 1:
         raise RuntimeError(f"Expected one SGLang CUDA graph output tensor, got {len(tensors)}")
@@ -233,8 +254,16 @@ def save_graph(graph, output: Any, key: Any, prefill_req_slots: int | None = Non
             packed_output = tensors or None
             _prefill_output_specs[filename] = spec
     graph_path = os.path.join(cfg.workspace_dir, filename)
-    with nvtx_range("foundry.save.graph_save"):
-        graph.save(graph_path, packed_output)
+    try:
+        with nvtx_range("foundry.save.graph_save"):
+            graph.save(graph_path, packed_output)
+    finally:
+        # CUDAGraph.save arms the pack at process exit (the standalone API's
+        # default); this integration packs into the rank directory once the
+        # captures end (pack_fatbins), and a SAVE that fails before then
+        # (this save included) must not write the images to ./hook_archive
+        # while it exits.
+        cge.set_pack_fatbins_on_exit(False)
 
     state.capture_index += 1
     logger.info("[Foundry] Saved SGLang CUDA graph %s key=%s", filename, key)
@@ -479,17 +508,21 @@ def bootstrap_collective_connections() -> None:
     """Connect every NCCL communicator the graphs may use, before capture, on
     SAVE and LOAD alike.
 
-    NCCL sets a communicator up lazily: the first collective on it allocates
-    its buffers and connects the peers, work that is illegal inside a
-    capturing stream ("operation not permitted when stream is capturing",
-    seen on the attention-TP sub-group's first reduce_scatter of
-    Qwen3.5-35B-A3B attention-TP2 + EP4). Native sglang hides this behind
-    its eager warmup forwards; Foundry runs none, so it issues one small and
-    one large all-reduce, all-gather and reduce-scatter on each initialized
-    group through sglang's own coordinators (so the same communicator
-    objects get connected), plus the WORLD group the DP gather can use. The
-    buffers this allocates go through the hook at the same sequence point on
-    both modes.
+    NCCL sets a communicator up lazily: the first collective of an algorithm
+    allocates its buffers and connects the peers (NCCL_RUNTIME_CONNECT, on by
+    default), work that is illegal inside a capturing stream ("operation not
+    permitted when stream is capturing", seen on the attention-TP sub-group's
+    first reduce_scatter of Qwen3.5-35B-A3B attention-TP2 + EP4) and, done
+    inside SAVE's capture, never done on LOAD. Native sglang hides this behind
+    its eager warmup forwards. Each group has two communicators: the captured
+    collectives run on its PyNccl communicator (sglang enables it inside
+    ``graph_capture()``), eager ones on the torch.distributed one. Both get one
+    small and one large all-reduce, all-gather and reduce-scatter (the sizes
+    pick the low-latency and the ring algorithms), plus the WORLD group the DP
+    gather can use. Point-to-point connections (all-to-all) are made by the
+    warm-up forward of the first captured shape, which runs inside
+    ``graph_capture()``. The buffers this allocates go through the hook at the
+    same sequence point on both modes.
     """
     import torch
     import torch.distributed as dist
@@ -501,42 +534,49 @@ def bootstrap_collective_connections() -> None:
     t0 = time.perf_counter()
     device = torch.device("cuda", torch.cuda.current_device())
     groups = []
-    for getter in (
-        ps.get_tp_group,
-        ps.get_attn_tp_group,
-        ps.get_moe_ep_group,
-        ps.get_moe_tp_group,
-        ps.get_moe_dp_group,
+    for name in (
+        "get_tp_group",
+        "get_attn_tp_group",
+        "get_shared_experts_tp_group",
+        "get_dcp_group",
+        "get_moe_ep_group",
+        "get_moe_tp_group",
+        "get_moe_dp_group",
     ):
+        getter = getattr(ps, name, None)
         try:
-            group = getter()
+            group = getter() if getter is not None else None
         except Exception:
             continue
         if group is not None and group.world_size > 1 and group not in groups:
             groups.append(group)
     sizes = (16, 4 << 20)  # elements: LL-sized, and ring-sized (8 MB bf16)
+
+    def ones(n):
+        return torch.ones(n, dtype=torch.bfloat16, device=device)
+
+    def empty(n):
+        return torch.empty(n, dtype=torch.bfloat16, device=device)
+
     connected = []
     for group in groups:
         ws = group.world_size
         for n in sizes:
-            group.all_reduce(torch.ones(n, dtype=torch.bfloat16, device=device))
-            group.all_gather_into_tensor(
-                torch.empty(ws * n, dtype=torch.bfloat16, device=device),
-                torch.ones(n, dtype=torch.bfloat16, device=device),
-            )
-            group.reduce_scatter_tensor(
-                torch.empty(n, dtype=torch.bfloat16, device=device),
-                torch.ones(ws * n, dtype=torch.bfloat16, device=device),
-            )
-        connected.append(f"{group.unique_name}(ws={ws})")
+            group.all_reduce(ones(n))
+            group.all_gather_into_tensor(empty(ws * n), ones(n))
+            group.reduce_scatter_tensor(empty(n), ones(ws * n))
+        pynccl = getattr(group, "pynccl_comm", None)
+        if pynccl is not None and getattr(pynccl, "available", False):
+            with pynccl.change_state(enable=True):
+                for n in sizes:
+                    pynccl.all_reduce(ones(n))
+                    pynccl.all_gather(empty(ws * n), ones(n))
+                    pynccl.reduce_scatter(empty(n), ones(ws * n))
+        connected.append(f"{group.unique_name}(ws={ws}{', pynccl' if pynccl else ''})")
     ws = dist.get_world_size()
     for n in sizes:
-        dist.all_reduce(torch.ones(n, dtype=torch.bfloat16, device=device), group=dist.group.WORLD)
-        dist.all_gather_into_tensor(
-            torch.empty(ws * n, dtype=torch.bfloat16, device=device),
-            torch.ones(n, dtype=torch.bfloat16, device=device),
-            group=dist.group.WORLD,
-        )
+        dist.all_reduce(ones(n), group=dist.group.WORLD)
+        dist.all_gather_into_tensor(empty(ws * n), ones(n), group=dist.group.WORLD)
     torch.cuda.synchronize()
     logger.info(
         "[Foundry] SGLang collective connections bootstrapped in %.3fs: %s + WORLD(ws=%d)",

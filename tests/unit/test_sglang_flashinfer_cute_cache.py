@@ -69,7 +69,10 @@ def fake_flashinfer(monkeypatch, tmp_path):
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(fcc, "_installed", None)
-    return types.SimpleNamespace(ccc=ccc, sibling=sibling, log=log, original=original)
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (9, 0))
+    return types.SimpleNamespace(ccc=ccc, sibling=sibling, log=log, original=original, core=core)
 
 
 def test_stable_key_goes_through_the_o_cache_and_rebinds_siblings(fake_flashinfer):
@@ -127,3 +130,33 @@ def test_gdn_flashinfer_detection(monkeypatch):
     assert not fcc.gdn_flashinfer_in_use()
     monkeypatch.setitem(sys.modules, fcc.SGLANG_GDN_FLASHINFER, types.ModuleType("x"))
     assert fcc.gdn_flashinfer_in_use()
+
+
+def test_cache_miss_without_jit_compiles_in_process(fake_flashinfer, monkeypatch):
+    """Under FLASHINFER_DISABLE_JIT a miss of the .o cache raises in FlashInfer's
+    loader; FlashInfer's own delta_rule path compiles in the process, and so does
+    the patched one."""
+    f = fake_flashinfer
+
+    class MissingJITCacheError(RuntimeError):
+        pass
+
+    jit_core = types.ModuleType("flashinfer.jit.core")
+    jit_core.MissingJITCacheError = MissingJITCacheError
+    monkeypatch.setitem(sys.modules, "flashinfer.jit.core", jit_core)
+
+    def missing(module_name, name, compile_fn, sources):
+        raise MissingJITCacheError(name)
+
+    f.core.build_and_load_cute_dsl_kernel = missing
+    fcc.install()
+    kernel = _Kernel((("dtype", "bf16"),))
+    assert f.ccc.cached_compile(kernel, compile_options="sm90") == ("compiled", kernel, "sm90")
+
+
+def test_not_installed_off_sm90(fake_flashinfer, monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (12, 0))
+    assert fcc.install() is None
+    assert fake_flashinfer.ccc.cached_compile is fake_flashinfer.original

@@ -50,17 +50,27 @@ def install() -> str | None:
     """Route ``custom_compile_cache.cached_compile`` (and the name as already
     imported by the delta_rule modules) through FlashInfer's persistent
     ``.o`` cache. Returns a status string for the log, or None when this
-    FlashInfer has no such module or helper (nothing to do). Idempotent."""
+    FlashInfer has no such module or helper, or the GPU is not SM90 (the
+    kernels this was measured with; FlashInfer's own compile also checks the
+    PTX it generates for SM12x, which this route would skip). Idempotent."""
     global _installed
     if _installed is not None:
         return _installed
     try:
+        import torch
+
+        if torch.cuda.get_device_capability()[0] != 9:
+            return None
         ccc = importlib.import_module(CACHE_MODULE)
         cute_dsl_core = importlib.import_module("flashinfer.jit.cute_dsl_core")
         cute = importlib.import_module("cutlass.cute")
     except Exception as exc:
         logger.debug("[Foundry] FlashInfer CuTe-DSL cache patch not applicable: %r", exc)
         return None
+    try:  # raised on a cache miss under FLASHINFER_DISABLE_JIT
+        missing_cache = importlib.import_module("flashinfer.jit.core").MissingJITCacheError
+    except Exception:
+        missing_cache = ()
     build_and_load = getattr(cute_dsl_core, "build_and_load_cute_dsl_kernel", None)
     original = getattr(ccc, "cached_compile", None)
     in_mem = getattr(ccc, "_in_mem_compile_cache", None)
@@ -83,9 +93,14 @@ def install() -> str | None:
         if _UNSTABLE_KEY.search(key_text):
             compiled = compile_fn()
         else:
-            compiled = build_and_load(
-                CACHED_OPS_MODULE, kernel_name(func, key_text), compile_fn, sources
-            )
+            try:
+                compiled = build_and_load(
+                    CACHED_OPS_MODULE, kernel_name(func, key_text), compile_fn, sources
+                )
+            except missing_cache:
+                # FlashInfer's own path compiles in the process whatever
+                # FLASHINFER_DISABLE_JIT says: so does this one on a miss.
+                compiled = compile_fn()
         in_mem[key] = compiled
         return compiled
 
