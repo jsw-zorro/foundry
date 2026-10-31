@@ -58,8 +58,21 @@ cuda_dotted() {
 
 if [[ "$DOCKER" == 1 ]]; then
     IMAGE="${FOUNDRY_BUILDER_IMAGE:-docker.io/pytorch/manylinux2_28-builder:cuda$(cuda_dotted "$CUDA_TAG")}"
+    # The output directory is mounted at /out (an --out outside the repository
+    # would otherwise be written inside the removed container).
+    [[ "$OUT" = /* ]] || OUT="$ROOT/$OUT"
+    mkdir -p "$OUT"
     FWD=()
-    for a in "${ARGS[@]}"; do [[ "$a" != --docker ]] && FWD+=("$a"); done
+    skip=0
+    for a in "${ARGS[@]}"; do
+        if [[ "$skip" == 1 ]]; then skip=0; continue; fi
+        case "$a" in
+            --docker) ;;
+            --out) skip=1 ;;
+            *) FWD+=("$a") ;;
+        esac
+    done
+    FWD+=(--out /out)
     PODMAN=0
     docker --version 2>/dev/null | grep -qi podman && PODMAN=1
     GPU_ARGS=()
@@ -77,7 +90,7 @@ if [[ "$DOCKER" == 1 ]]; then
     OWNER_ARGS=(-e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)")
     [[ "$PODMAN" == 1 ]] && OWNER_ARGS=()
     log "running inside $IMAGE"
-    exec docker run --rm "${GPU_ARGS[@]}" -v "$ROOT:/src" -w /src \
+    exec docker run --rm "${GPU_ARGS[@]}" -v "$ROOT:/src" -v "$OUT:/out" -w /src \
         -e MAX_JOBS "${OWNER_ARGS[@]}" \
         "$IMAGE" bash tools/release/build_wheel.sh "${FWD[@]}"
 fi
@@ -233,6 +246,7 @@ fi
 
 cp "$WHEEL" "$OUT/"
 if [[ -n "${HOST_UID:-}" ]]; then
-    chown -R "$HOST_UID:${HOST_GID:-$HOST_UID}" "$OUT" 2>/dev/null || true
+    # Only the wheel: --out may be a directory shared with other files (it is mounted at /out).
+    chown "$HOST_UID:${HOST_GID:-$HOST_UID}" "$OUT/$(basename "$WHEEL")" 2>/dev/null || true
 fi
 log "done: $OUT/$(basename "$WHEEL")"
