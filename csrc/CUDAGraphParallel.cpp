@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <sstream>
 #include <vector>
+#include <system_error>
 #include <thread>
 #include <algorithm>
 #include <queue>
@@ -44,21 +45,29 @@ namespace {
 class SimpleThreadPool {
  public:
   explicit SimpleThreadPool(size_t num_threads) : stop_(false) {
-    for (size_t i = 0; i < num_threads; ++i) {
-      workers_.emplace_back([this] {
-        while (true) {
-          std::function<void()> task;
-          {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
-            if (stop_ && tasks_.empty())
-              return;
-            task = std::move(tasks_.front());
-            tasks_.pop();
+    try {
+      for (size_t i = 0; i < num_threads; ++i) {
+        workers_.emplace_back([this] {
+          while (true) {
+            std::function<void()> task;
+            {
+              std::unique_lock<std::mutex> lock(mutex_);
+              cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+              if (stop_ && tasks_.empty())
+                return;
+              task = std::move(tasks_.front());
+              tasks_.pop();
+            }
+            task();
           }
-          task();
-        }
-      });
+        });
+      }
+    } catch (...) {
+      // A thread that could not be created (EAGAIN at the process limit): the
+      // destructor does not run for a constructor that throws, so stop and join
+      // the workers already started before the members go away.
+      stop_workers();
+      throw;
     }
   }
 
@@ -75,18 +84,21 @@ class SimpleThreadPool {
     return result;
   }
 
-  ~SimpleThreadPool() {
+  ~SimpleThreadPool() { stop_workers(); }
+
+ private:
+  void stop_workers() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       stop_ = true;
     }
     cv_.notify_all();
     for (auto& w : workers_) {
-      w.join();
+      if (w.joinable())
+        w.join();
     }
   }
 
- private:
   std::vector<std::thread> workers_;
   std::queue<std::function<void()>> tasks_;
   std::mutex mutex_;
@@ -263,6 +275,50 @@ namespace {
 using bt_clock = std::chrono::steady_clock;
 inline double bt_ms(bt_clock::time_point a) {
   return std::chrono::duration<double, std::milli>(bt_clock::now() - a).count();
+}
+
+// Whether a kernel node was launched through 'extra' with an argument buffer. For an
+// 'extra' list without one (a kernel without parameters) SAVE writes ["CU_LAUNCH_PARAM_END"]
+// alone; LOAD adds such a node with no parameters.
+bool launched_with_arg_buffer(const boost::json::object& params) {
+  const boost::json::array& extra = params.at("extra").as_array();
+  return !(extra.empty() || (extra.size() == 1 && extra[0].is_string() &&
+                             extra[0].as_string() == "CU_LAUNCH_PARAM_END"));
+}
+
+// The argument buffer of a kernel node launched through 'extra'. SAVE writes
+// the list as CU_LAUNCH_PARAM_BUFFER_POINTER, "null" and
+// CU_LAUNCH_PARAM_BUFFER_SIZE, <bytes> (either pair first), then
+// CU_LAUNCH_PARAM_END, and the bytes as extra_argBuffer_hex. Any other list,
+// or a size that differs from the bytes, is refused.
+std::vector<uint8_t> decode_extra_arg_buffer(const boost::json::object& params) {
+  const boost::json::array& extra = params.at("extra").as_array();
+  auto is = [&](size_t i, const char* s) {
+    return extra[i].is_string() && extra[i].as_string() == s;
+  };
+  bool pointer = false, size_given = false;
+  uint64_t size = 0;
+  size_t i = 0;
+  for (; i + 1 < extra.size(); i += 2) {
+    if (is(i, "CU_LAUNCH_PARAM_BUFFER_POINTER") && !pointer && is(i + 1, "null")) {
+      pointer = true;
+    } else if (is(i, "CU_LAUNCH_PARAM_BUFFER_SIZE") && !size_given && extra[i + 1].is_number()) {
+      size = extra[i + 1].to_number<uint64_t>();
+      size_given = true;
+    } else {
+      break;
+    }
+  }
+  TORCH_CHECK(pointer && size_given && i + 1 == extra.size() && is(i, "CU_LAUNCH_PARAM_END"),
+              "kernel node 'extra' is not BUFFER_POINTER / BUFFER_SIZE / END: ",
+              boost::json::serialize(extra));
+  const std::string hex(params.at("extra_argBuffer_hex").as_string());
+  TORCH_CHECK(hex.size() == 2 * size, "kernel node 'extra' states ", size,
+              " argument bytes, extra_argBuffer_hex holds ", hex.size() / 2);
+  std::vector<uint8_t> buffer(size);
+  for (size_t j = 0; j < size; ++j)
+    buffer[j] = static_cast<uint8_t>(std::stoul(hex.substr(j * 2, 2), nullptr, 16));
+  return buffer;
 }
 }  // namespace
 
@@ -555,47 +611,20 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         node_params.kernelParams = param_ptrs.data();
       }
 
-      // Decode extra config
-      const json::array& extra_array = params.at("extra").as_array();
-      if (!extra_array.empty()) {
-        all_extra_configs.emplace_back();
-        auto& extra_config = all_extra_configs.back();
-
-        for (size_t i = 0; i < extra_array.size(); ++i) {
-          if (extra_array[i].is_string()) {
-            std::string str_val = extra_array[i].as_string().c_str();
-            if (str_val == "CU_LAUNCH_PARAM_BUFFER_POINTER") {
-              extra_config.push_back(CU_LAUNCH_PARAM_BUFFER_POINTER);
-            } else if (str_val == "CU_LAUNCH_PARAM_BUFFER_SIZE") {
-              extra_config.push_back(CU_LAUNCH_PARAM_BUFFER_SIZE);
-            } else if (str_val == "CU_LAUNCH_PARAM_END") {
-              extra_config.push_back(CU_LAUNCH_PARAM_END);
-            } else if (str_val == "null") {
-              std::string argBuffer_hex = params.at("extra_argBuffer_hex").as_string().c_str();
-              if (!argBuffer_hex.empty()) {
-                all_arg_buffers.emplace_back();
-                auto& arg_buffer = all_arg_buffers.back();
-                arg_buffer.resize(argBuffer_hex.length() / 2);
-                for (size_t j = 0; j < arg_buffer.size(); ++j) {
-                  std::string byte_str = argBuffer_hex.substr(j * 2, 2);
-                  arg_buffer[j] = std::stoul(byte_str, nullptr, 16);
-                }
-                extra_config.push_back(arg_buffer.data());
-              } else {
-                extra_config.push_back(nullptr);
-              }
-            }
-          } else if (extra_array[i].is_uint64() || extra_array[i].is_int64()) {
-            uint64_t val = extra_array[i].to_number<uint64_t>();
-            if (i > 0 && extra_config.back() == CU_LAUNCH_PARAM_BUFFER_SIZE) {
-              all_arg_buffer_sizes.push_back(val);
-              extra_config.push_back(&all_arg_buffer_sizes.back());
-            } else {
-              extra_config.push_back(reinterpret_cast<void*>(static_cast<uintptr_t>(val)));
-            }
-          }
-        }
-        node_params.extra = extra_config.data();
+      // Decode extra config (the node is added below, before the next node
+      // reuses these buffers' containers)
+      if (launched_with_arg_buffer(params)) {
+        all_arg_buffers.push_back(decode_extra_arg_buffer(params));
+        all_arg_buffer_sizes.push_back(all_arg_buffers.back().size());
+        all_extra_configs.push_back({CU_LAUNCH_PARAM_BUFFER_POINTER, all_arg_buffers.back().data(),
+                                     CU_LAUNCH_PARAM_BUFFER_SIZE, &all_arg_buffer_sizes.back(),
+                                     CU_LAUNCH_PARAM_END});
+        node_params.extra = all_extra_configs.back().data();
+      }
+      if (!node_params.extra) {
+        const auto* data = has_kernel_params ? &all_kernel_params.back() : nullptr;
+        check_archived_kernel_params(func_handle_variant, function_name, data ? data->size() : 0,
+                                     [&](size_t i) { return (*data)[i].size(); });
       }
 
       // Add kernel node
@@ -1204,31 +1233,13 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
       }
 
       // Decode extra config — only store the arg buffer and size
-      const json::array& extra_array = params.at("extra").as_array();
-      if (!extra_array.empty()) {
-        for (size_t i = 0; i < extra_array.size(); ++i) {
-          if (extra_array[i].is_string()) {
-            std::string str_val = extra_array[i].as_string().c_str();
-            if (str_val == "null") {
-              std::string argBuffer_hex = params.at("extra_argBuffer_hex").as_string().c_str();
-              if (!argBuffer_hex.empty()) {
-                u.arg_buffer.resize(argBuffer_hex.length() / 2);
-                for (size_t j = 0; j < u.arg_buffer.size(); ++j) {
-                  std::string byte_str = argBuffer_hex.substr(j * 2, 2);
-                  u.arg_buffer[j] = std::stoul(byte_str, nullptr, 16);
-                }
-              }
-            }
-          } else if (extra_array[i].is_uint64() || extra_array[i].is_int64()) {
-            uint64_t val = extra_array[i].to_number<uint64_t>();
-            // Check if this is the buffer size (follows CU_LAUNCH_PARAM_BUFFER_SIZE)
-            if (i > 0 && extra_array[i - 1].is_string() &&
-                extra_array[i - 1].as_string() == "CU_LAUNCH_PARAM_BUFFER_SIZE") {
-              u.arg_buffer_size = val;
-            }
-          }
-        }
+      if (launched_with_arg_buffer(params)) {
+        u.arg_buffer = decode_extra_arg_buffer(params);
+        u.arg_buffer_size = u.arg_buffer.size();
         // extra_config rebuilt in fixup_pointers()
+      } else {
+        check_archived_kernel_params(func_handle_variant, function_name, u.kernel_param_data.size(),
+                                     [&](size_t i) { return u.kernel_param_data[i].size(); });
       }
 
     } else if (node_type == "MemsetNode") {
@@ -1506,6 +1517,8 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
           u.arg_buffer_size = k.arg_buffer_size;
           // extra_config rebuilt in fixup_pointers()
         } else {
+          check_archived_kernel_params(func_handle_variant, function_name, k.num_params,
+                                       [&](size_t j) { return pe[j].size; });
           // Per-param style: copy each param's raw bytes
           u.kernel_param_data.resize(k.num_params);
           for (uint32_t j = 0; j < k.num_params; j++) {
@@ -1992,15 +2005,26 @@ CUgraph build_prewarm_graph(const BinaryGraphFile& b, CUcontext ctx, CUdevice de
       p.blockDimZ = k.blockDimZ;
       p.sharedMemBytes = k.sharedMemBytes;
       p.ctx = ctx;
-      auto h = query_function_handle(k.binary_hash,
-                                     b.get_string(k.function_name_offset, k.function_name_length));
+      const std::string name = b.get_string(k.function_name_offset, k.function_name_length);
+      auto h = query_function_handle(k.binary_hash, name);
       if (std::holds_alternative<CUkernel>(h))
         p.kern = std::get<CUkernel>(h);
       else
         p.func = std::get<CUfunction>(h);
+      const bf::BinParamEntry* pe = reinterpret_cast<const bf::BinParamEntry*>(
+          reinterpret_cast<const uint8_t*>(param_idx) + k.param_index_offset);
+      const bool extra_style = k.arg_buffer_offset != 0xFFFFFFFF;
+      try {
+        if (!extra_style)
+          check_archived_kernel_params(h, name, k.num_params, [&](size_t j) { return pe[j].size; });
+      } catch (const std::exception& ex) {
+        fprintf(stderr, "[foundry] exec pool prewarm: %s; graph skipped\n", ex.what());
+        cuGraphDestroy(g);
+        return nullptr;
+      }
       size_t arg_size = k.arg_buffer_size;
       void* extra[5];
-      if (k.arg_buffer_offset != 0xFFFFFFFF) {
+      if (extra_style) {
         extra[0] = CU_LAUNCH_PARAM_BUFFER_POINTER;
         extra[1] = const_cast<uint8_t*>(abd + k.arg_buffer_offset);
         extra[2] = CU_LAUNCH_PARAM_BUFFER_SIZE;
@@ -2008,8 +2032,6 @@ CUgraph build_prewarm_graph(const BinaryGraphFile& b, CUcontext ctx, CUdevice de
         extra[4] = CU_LAUNCH_PARAM_END;
         p.extra = extra;
       } else {
-        const bf::BinParamEntry* pe = reinterpret_cast<const bf::BinParamEntry*>(
-            reinterpret_cast<const uint8_t*>(param_idx) + k.param_index_offset);
         ptrs.resize(k.num_params);
         for (uint32_t j = 0; j < k.num_params; ++j)
           ptrs[j] = const_cast<uint8_t*>(pd + pe[j].data_offset);
@@ -2050,8 +2072,14 @@ CUgraph build_prewarm_graph(const BinaryGraphFile& b, CUcontext ctx, CUdevice de
         f = d->from_id;
         t = d->to_id;
       }
-      from[i] = id_to_node.at(f);
-      to[i] = id_to_node.at(t);
+      auto fi = id_to_node.find(f), ti = id_to_node.find(t);
+      if (fi == id_to_node.end() || ti == id_to_node.end()) {
+        fprintf(stderr, "[foundry] exec pool prewarm: dependency on unknown node; graph skipped\n");
+        cuGraphDestroy(g);
+        return nullptr;
+      }
+      from[i] = fi->second;
+      to[i] = ti->second;
     }
     CUresult r = add_graph_dependencies(g, from.data(), to.data(), ed.data(), nd);
     if (r != CUDA_SUCCESS) {
@@ -2098,7 +2126,16 @@ void run_exec_pool_prewarm(const std::vector<std::string>& json_paths, CUcontext
     if (!g)
       continue;
     auto t_i = clk::now();
-    execs.push_back(CUDAGraph::instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(g)));
+    cudaGraphExec_t exec = nullptr;
+    try {
+      exec = CUDAGraph::instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(g));
+    } catch (const std::exception& e) {
+      // Stop here; the execs instantiated so far are destroyed below as usual.
+      fprintf(stderr, "[foundry] exec pool prewarm: instantiate failed (%s); stopped\n", e.what());
+      cuGraphDestroy(g);
+      break;
+    }
+    execs.push_back(exec);
     inst_ms += ms_since(t_i);
     C10_CUDA_DRIVER_CHECK(cuGraphDestroy(g));
     nodes += n;
@@ -2170,14 +2207,21 @@ void CUDAGraph::start_exec_pool_prewarm(const std::vector<std::string>& json_pat
     g_prewarm_abandon = false;
     g_prewarm_done = promise->get_future().share();
   }
-  std::thread([json_paths, ctx, dev, promise]() {
-    try {
-      run_exec_pool_prewarm(json_paths, ctx, dev);
-      promise->set_value();
-    } catch (...) {
-      promise->set_exception(std::current_exception());
-    }
-  }).detach();
+  try {
+    std::thread([json_paths, ctx, dev, promise]() {
+      try {
+        run_exec_pool_prewarm(json_paths, ctx, dev);
+        promise->set_value();
+      } catch (...) {
+        promise->set_exception(std::current_exception());
+      }
+    }).detach();
+  } catch (const std::system_error& e) {
+    // The prewarm is optional: without its thread Phase 2 grows the exec pool itself.
+    fprintf(stderr, "[foundry] exec pool prewarm not started (%s)\n", e.what());
+    std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+    g_prewarm_done = std::shared_future<void>();
+  }
 }
 
 // ============================================================================
@@ -2207,6 +2251,8 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
     return pending;
   }
 
+  TORCH_CHECK(num_threads > 0, "start_graph_builds: num_threads must be positive, got ",
+              num_threads);
   int actual_threads = std::min(num_threads, static_cast<int>(num_graphs));
 
   CUcontext main_ctx;
@@ -2306,14 +2352,20 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       // Actually, generators are extracted BEFORE prepare_graph_shell
       // and deferred — so we just extract them here.
       if (bf_data.header.flags & bf::FLAG_HAS_GENERATORS) {
-        const bf::BinGenerator* gens =
-            bf_data.section_ptr<bf::BinGenerator>(bf::SECTION_GENERATORS_TABLE);
+        const uint8_t* gens = bf_data.section_ptr<uint8_t>(bf::SECTION_GENERATORS_TABLE);
+        const size_t record = bf::generator_record_size(bf_data.header.version);
         boost::json::array gens_array;
         for (uint32_t g = 0; g < bf_data.header.num_generators; g++) {
+          bf::BinGenerator gen{};  // v1/v2 records leave the addresses 0
+          memcpy(&gen, gens + g * record, record);
           boost::json::object go;
-          go["id"] = gens[g].id;
-          go["seed"] = gens[g].seed;
-          go["wholegraph_increment"] = gens[g].wholegraph_increment;
+          go["id"] = gen.id;
+          go["seed"] = gen.seed;
+          go["wholegraph_increment"] = gen.wholegraph_increment;
+          if (gen.seed_ptr != 0 || gen.offset_ptr != 0) {
+            go["seed_ptr"] = gen.seed_ptr;
+            go["offset_ptr"] = gen.offset_ptr;
+          }
           gens_array.push_back(go);
         }
         pending->entries[i].generators_meta = boost::json::value(std::move(gens_array));
@@ -2403,19 +2455,33 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         auto manifest_val = boost::json::parse(manifest_str);
         const auto& groups = manifest_val.as_object().at("topology_groups").as_array();
 
+        // Each graph of this call must be exactly one group's template or member.
+        std::vector<bool> assigned(num_graphs, false);
+        auto assign = [&](size_t idx, const std::string& name) {
+          TORCH_CHECK(!assigned[idx], manifest_path, ": ", name,
+                      " is in more than one topology group");
+          assigned[idx] = true;
+        };
         for (const auto& group_val : groups) {
           const auto& group = group_val.as_object();
           std::string tmpl_name = group.at("template").as_string().c_str();
+          const auto& members = group.at("members").as_array();
 
           auto tmpl_it = filename_to_idx.find(tmpl_name);
-          if (tmpl_it == filename_to_idx.end())
+          if (tmpl_it == filename_to_idx.end()) {
+            // Another partition's group (each call loads one partition).
+            for (const auto& member_val : members)
+              TORCH_CHECK(!filename_to_idx.count(member_val.as_string().c_str()), manifest_path,
+                          ": ", member_val.as_string().c_str(), " is a member of template ",
+                          tmpl_name, ", which is not loaded with it");
             continue;
+          }
           size_t tmpl_idx = tmpl_it->second;
+          assign(tmpl_idx, tmpl_name);
 
           std::string key = std::to_string(tmpl_idx);  // use template index as key
           topology_groups[key].push_back(tmpl_idx);
 
-          const auto& members = group.at("members").as_array();
           for (const auto& member_val : members) {
             std::string member_name = member_val.as_string().c_str();
             if (member_name == tmpl_name)
@@ -2424,13 +2490,18 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
             if (member_it == filename_to_idx.end())
               continue;
             size_t member_idx = member_it->second;
+            assign(member_idx, member_name);
             topology_groups[key].push_back(member_idx);
             template_for[member_idx] = tmpl_idx;
           }
         }
+        for (size_t i = 0; i < num_graphs; ++i)
+          TORCH_CHECK(assigned[i], manifest_path, ": ", json_paths[i], " is in no topology group");
         used_manifest = true;
         fprintf(stderr, "[foundry] Using graph_manifest.json (%zu topology groups)\n",
                 topology_groups.size());
+      } catch (const c10::Error&) {
+        throw;  // A manifest that parses but does not cover this call's graphs exactly.
       } catch (const std::exception& e) {
         fprintf(stderr,
                 "[foundry] Warning: failed to parse graph_manifest.json: %s, "
@@ -2557,11 +2628,11 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       //     contexts), so one instantiate thread is the whole budget; graph-side param rewrites
       //     of one group overlap the instantiation of another group's graph.
       // Member order within a group is unchanged (index order on the group's single builder
-      // graph: a member inherits the attributes it does not record from the previous
-      // rewrite, as before); members of different groups are interleaved round-robin so a
-      // rewrite always has another group's instantiate to overlap. Templates without a
-      // complete binary (JSON-only archives, or attributes the node table cannot hold) are
-      // built from the JSON inside their instantiate job, as before.
+      // graph; each rewrite resets the kernel-node attributes the member does not record, see
+      // reset_unrecorded_kernel_attrs); members of different groups are interleaved
+      // round-robin so a rewrite always has another group's instantiate to overlap. Templates
+      // without a complete binary (JSON-only archives, or attributes the node table cannot
+      // hold) are built from the JSON inside their instantiate job, as before.
       using clk = std::chrono::steady_clock;
       auto ms_since = [](clk::time_point a) {
         return std::chrono::duration<double, std::milli>(clk::now() - a).count();
@@ -2584,10 +2655,11 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       };
 
       if (share_mode) {
-        // The saved topology key omits edges, and cuGraphExecUpdate needs the member's DAG
-        // to equal the template's. Refine each group by its ordered nodes (type, kernel binary)
-        // and full dependency table (from the .cugraph binaries; stripped member
-        // JSON is not needed). Eager mode keeps the saved groups.
+        // The saved topology key holds node types, cluster dims and a hash of the edges, not
+        // the kernels, and cuGraphExecUpdate needs the member's DAG to equal the template's.
+        // Refine each group by its ordered nodes (type, kernel binary) and full dependency
+        // table, compared exactly (from the .cugraph binaries; stripped member JSON is not
+        // needed). Eager mode keeps the saved groups.
         auto dag = [&](size_t idx) {
           const auto& bin = bin_files[idx];
           TORCH_CHECK(binary_template(idx) && bin.header.version >= 2,
@@ -2617,26 +2689,87 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
             continue;
           }
           // Per node: type, and for a kernel node the hash of the binary (module / library) its
-          // function comes from. cuGraphExecUpdate carries a switch to another function of the
+          // function comes from, its effective cluster and preferred-cluster dims and whether it
+          // is cooperative. cuGraphExecUpdate carries a switch to another function of the
           // same binary, but not to another binary of the same-named function (a different
-          // Triton specialization updated "successfully" and launched wrong), so such members
-          // get their own template. Cluster dims are already in the saved topology key.
-          using NodeKey = std::pair<uint32_t, uint64_t>;
+          // Triton specialization updated "successfully" and launched wrong), and not the
+          // kernel-node attributes (a cooperative node cannot become a plain one, and cluster
+          // dims are not in the saved key with FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0), so such
+          // members get their own template. So do members whose memcpy or memset extents, or
+          // whose launch dims of a clustered kernel, differ from the template's: switching
+          // such members gave tokens that differ from native on a TP2 hybrid-attention MoE
+          // model (each of these node kinds switches correctly in isolation; cause not
+          // determined), and with them split the same archive matches native.
+          using NodeKey = std::array<uint64_t, 16>;
           using Signature = std::pair<std::vector<NodeKey>, std::vector<std::array<uint32_t, 5>>>;
           // Ordered keys compare the full evidence, without hash collisions.
           std::map<Signature, std::vector<size_t>> partitions;
           for (size_t idx : indices) {
             auto edges = dag(idx);
             const auto& bin = bin_files[idx];
+            binary_format::BinCommonKernelAttrs common{};
+            if (bin.header.flags & binary_format::FLAG_HAS_COMMON_KERNEL_ATTRS)
+              memcpy(&common, bin.section_ptr<uint8_t>(binary_format::SECTION_COMMON_KERNEL_ATTRS),
+                     sizeof(common));
             std::vector<NodeKey> nodes;
             nodes.reserve(bin.header.num_nodes);
             for (uint32_t n = 0; n < bin.header.num_nodes; ++n) {
               const auto& e = bin.node_table()[n];
               // Copies: the node table is packed, its fields cannot bind to references.
               const uint32_t type = e.type;
-              const uint64_t binary_hash =
-                  type == binary_format::NODE_KERNEL ? uint64_t{e.kernel.binary_hash} : 0;
-              nodes.emplace_back(type, binary_hash);
+              NodeKey key{type};
+              if (type == binary_format::NODE_KERNEL) {
+                const binary_format::BinKernelNode k = e.kernel;
+                key[1] = k.binary_hash;
+                // Merged as prepare_on_demand_graph_binary merges them: common, then the
+                // node's own, then the function's compiled cluster.
+                auto pick = [&](uint32_t flag, uint64_t common_v, uint64_t node_v) {
+                  return (k.kna_flags & flag) ? node_v : (common.flags & flag) ? common_v : 0;
+                };
+                key[2] =
+                    pick(binary_format::KNA_CLUSTER_DIM, common.clusterDimX, k.kna_clusterDimX);
+                key[3] =
+                    pick(binary_format::KNA_CLUSTER_DIM, common.clusterDimY, k.kna_clusterDimY);
+                key[4] =
+                    pick(binary_format::KNA_CLUSTER_DIM, common.clusterDimZ, k.kna_clusterDimZ);
+                if (k.required_cluster_width > 0 || k.required_cluster_height > 0 ||
+                    k.required_cluster_depth > 0) {
+                  key[2] = std::max<int32_t>(k.required_cluster_width, 1);
+                  key[3] = std::max<int32_t>(k.required_cluster_height, 1);
+                  key[4] = std::max<int32_t>(k.required_cluster_depth, 1);
+                }
+                key[5] = pick(binary_format::KNA_PREFERRED_CLUSTER_DIM, common.preferredClusterDimX,
+                              k.kna_preferredClusterDimX);
+                key[6] = pick(binary_format::KNA_PREFERRED_CLUSTER_DIM, common.preferredClusterDimY,
+                              k.kna_preferredClusterDimY);
+                key[7] = pick(binary_format::KNA_PREFERRED_CLUSTER_DIM, common.preferredClusterDimZ,
+                              k.kna_preferredClusterDimZ);
+                key[8] = pick(binary_format::KNA_COOPERATIVE, uint32_t(common.cooperative),
+                              uint32_t(k.kna_cooperative));
+                if (key[2] > 1 || key[3] > 1 || key[4] > 1 || key[5] > 0) {
+                  key[9] = k.gridDimX;
+                  key[10] = k.gridDimY;
+                  key[11] = k.gridDimZ;
+                  key[12] = k.blockDimX;
+                  key[13] = k.blockDimY;
+                  key[14] = k.blockDimZ;
+                  key[15] = k.sharedMemBytes;
+                }
+              } else if (type == binary_format::NODE_MEMCPY) {
+                const binary_format::BinMemcpyNode m = e.memcpy;
+                key[9] = m.WidthInBytes;
+                key[10] = m.Height;
+                key[11] = m.Depth;
+                key[12] = m.srcPitch;
+                key[13] = m.dstPitch;
+              } else if (type == binary_format::NODE_MEMSET) {
+                const binary_format::BinMemsetNode m = e.memset;
+                key[9] = m.width;
+                key[10] = m.height;
+                key[11] = m.elementSize;
+                key[12] = m.pitch;
+              }
+              nodes.push_back(key);
             }
             partitions[{std::move(nodes), std::move(edges)}].push_back(idx);
           }
@@ -2649,8 +2782,8 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         }
         topology_groups = std::move(refined_groups);
         fprintf(stderr,
-                "[foundry] exec share: %zu saved groups -> %zu templates (refined by DAG and "
-                "kernel binaries)\n",
+                "[foundry] exec share: %zu saved groups -> %zu templates (refined by DAG, "
+                "kernel binaries and attributes, copy extents)\n",
                 coarse_count, topology_groups.size());
       }
 
@@ -2710,6 +2843,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       // Declared before the instantiate worker: its jobs use them until it is joined.
       double tmpl_build_ms = 0, tmpl_inst_ms = 0, member_wait_ms = 0;
       bool prewarm_done = false;
+      // Free device memory around Phase 2's instantiates: what the execs took beyond the
+      // driver's pool (the exec pool prewarm is meant to make this ~0).
+      size_t free_before = 0, free_after = 0, mem_total = 0;
       const double phase2_start_epoch = epoch_s();
       std::mutex stats_mu;  // tmpl_inst_ms is written by the instantiate thread
       SerialWorker inst(main_ctx, [&] {
@@ -2726,9 +2862,6 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           inst.push(std::move(job));
       };
 
-      // Free device memory around Phase 2's instantiates: what the execs took beyond the driver's
-      // pool (the exec pool prewarm is meant to make this ~0).
-      size_t free_before = 0, free_after = 0, mem_total = 0;
       submit([&prewarm_done, &free_before, &mem_total] {
         prewarm_done = join_exec_pool_prewarm();
         C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_before, &mem_total));
@@ -2942,6 +3075,107 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
 // SAVE mode.
 // ============================================================================
 
+void restore_graph_state(CUDAGraph& graph, const boost::json::array& generators,
+                         const boost::json::object& alloc_events,
+                         CUDAGeneratorStateRegistry* registry, size_t index) {
+  // Register the generators before the allocator replay, as SAVE created them
+  // before the capture.
+  //
+  // The first registration lazily creates the generator state's
+  // seed/offset_extragraph_ tensors (two at::empty in
+  // CUDAGeneratorState::register_graph). Whether that at::empty grows a
+  // fresh caching-allocator segment depends on the free-pool state, which
+  // is NOT mirrored between SAVE and LOAD (SAVE's lazy init fires inside
+  // capture_begin, before the start_base_addr snapshot). If the growth
+  // happened inside the tracked region here, the VMM cursor would move
+  // past the recorded start_base_addr and replay_hook_events_from_json
+  // below would abort ("Memory offset mismatch during replay", observed
+  // as a 2 MB drift on A100). Suspend the region so any segment growth
+  // lands outside the tracked cursor.
+  struct RngState {
+    c10::intrusive_ptr<at::CUDAGeneratorState> state;
+    uintptr_t seed_ptr, offset_ptr;
+  };
+  std::vector<RngState> rng_states;  // generators whose SAVE addresses are recorded
+  {
+    foundry::SuspendAllocationRegion suspend_region;
+    for (const auto& gen_val : generators) {
+      const boost::json::object& gen_obj = gen_val.as_object();
+      uint64_t state_id = gen_obj.at("id").to_number<uint64_t>();
+      uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
+      uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
+
+      TORCH_CHECK(registry != nullptr, "restore_graph_state: generators without a registry");
+      auto state = registry->get_state_from_id(state_id, seed);
+      graph.register_generator_state(state, wholegraph_increment);
+      if (wholegraph_increment > 0 && gen_obj.contains("seed_ptr"))
+        rng_states.push_back({state, gen_obj.at("seed_ptr").to_number<uintptr_t>(),
+                              gen_obj.at("offset_ptr").to_number<uintptr_t>()});
+    }
+  }
+
+  // Replay allocator events (advances VMM cursor)
+  foundry::replay_hook_events_from_json(alloc_events);
+
+  // The restored Philox kernels read the seed and offset at SAVE's addresses, and
+  // replay_prologue fills the tensors registered above. Where those were allocated
+  // elsewhere, use SAVE's addresses when a replayed allocation holds them (SAVE grew a
+  // segment for them while recording a graph; on LOAD that memory is mapped for the
+  // restored graphs and no allocator hands it out); otherwise the graph would draw from an
+  // unset state, and LOAD stops.
+  static std::mutex replayed_mutex;
+  static std::vector<std::pair<uint64_t, uint64_t>> replayed_ranges;  // [begin, end), still mapped
+  static std::vector<std::pair<uintptr_t, size_t>> rebound;           // (SAVE address, graph index)
+  std::lock_guard<std::mutex> replayed_lock(replayed_mutex);
+  for (const auto& ev : alloc_events.at("events").as_array()) {
+    const auto& e = ev.as_object();
+    const auto& type = e.at("type").as_string();
+    if (type == "alloc") {
+      const uint64_t a = e.at("ptr").to_number<uint64_t>();
+      replayed_ranges.emplace_back(a, a + e.at("size").to_number<uint64_t>());
+    } else if (type == "free") {
+      const uint64_t a = e.at("ptr").to_number<uint64_t>();
+      // The replay unmapped it: it holds no RNG state any more.
+      for (auto it = replayed_ranges.begin(); it != replayed_ranges.end();) {
+        if (it->first != a) {
+          ++it;
+          continue;
+        }
+        for (const auto& [p, g] : rebound)
+          TORCH_CHECK(p < it->first || p >= it->second, "LOAD: graph ", index,
+                      " frees the memory that holds the RNG seed/offset of graph ", g);
+        it = replayed_ranges.erase(it);
+      }
+    }
+  }
+  for (const auto& r : rng_states) {
+    auto [seed_ptr, offset_ptr] = graph.rng_state_addresses(r.state);
+    if (seed_ptr == r.seed_ptr && offset_ptr == r.offset_ptr)
+      continue;
+    auto replayed = [&](uintptr_t p) {
+      for (const auto& [a, b] : replayed_ranges)
+        if (p >= a && p + sizeof(int64_t) <= b)
+          return true;
+      return false;
+    };
+    auto hex = [](uintptr_t p) {
+      char buf[24];
+      snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)p);
+      return std::string(buf);
+    };
+    TORCH_CHECK(replayed(r.seed_ptr) && replayed(r.offset_ptr) &&
+                    graph.rebind_rng_state(r.state, r.seed_ptr, r.offset_ptr),
+                "LOAD: graph ", index, " reads its RNG seed/offset at ", hex(r.seed_ptr), "/",
+                hex(r.offset_ptr), " (SAVE's tensors), but they are at ", hex(seed_ptr), "/",
+                hex(offset_ptr), " in this process, outside the memory the graph restores");
+    rebound.emplace_back(r.seed_ptr, index);
+    rebound.emplace_back(r.offset_ptr, index);
+    fprintf(stderr,
+            "[foundry] LOAD: graph %zu reads its RNG seed/offset at SAVE's addresses %s/%s\n",
+            index, hex(r.seed_ptr).c_str(), hex(r.offset_ptr).c_str());
+  }
+}
+
 // Per-entry finish. shared_future::get is repeatable and rethrows a Phase 2
 // failure on every call (wait() dropped it and let unbuilt graphs reach replay).
 GraphLoadResult finish_one_graph_load_impl(std::shared_ptr<PendingGraphLoads> pending, size_t index,
@@ -2957,38 +3191,11 @@ GraphLoadResult finish_one_graph_load_impl(std::shared_ptr<PendingGraphLoads> pe
   }
 
   auto& entry = pending->entries[index];
-
-  // Register deferred generators (before allocator replay to match
-  // SAVE mode timing where generators are created before graph capture).
-  //
-  // The first registration lazily creates the generator state's
-  // seed/offset_extragraph_ tensors (two at::empty in
-  // CUDAGeneratorState::register_graph). Whether that at::empty grows a
-  // fresh caching-allocator segment depends on the free-pool state, which
-  // is NOT mirrored between SAVE and LOAD (SAVE's lazy init fires inside
-  // capture_begin, before the start_base_addr snapshot). If the growth
-  // happened inside the tracked region here, the VMM cursor would move
-  // past the recorded start_base_addr and replay_hook_events_from_json
-  // below would abort ("Memory offset mismatch during replay", observed
-  // as a 2 MB drift on A100). Suspend the region so any segment growth
-  // lands outside the tracked cursor.
-  if (pending->registry && !entry.generators_meta.is_null()) {
-    foundry::SuspendAllocationRegion suspend_region;
-    const boost::json::array& gen_array = entry.generators_meta.as_array();
-    for (const auto& gen_val : gen_array) {
-      const boost::json::object& gen_obj = gen_val.as_object();
-      uint64_t state_id = gen_obj.at("id").to_number<uint64_t>();
-      uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
-      uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
-
-      auto state = pending->registry->get_state_from_id(state_id, seed);
-      entry.graph->register_generator_state(state, wholegraph_increment);
-    }
-  }
-
-  // Replay allocator events (advances VMM cursor)
-  const boost::json::object& alloc_events = entry.allocator_events.as_object();
-  foundry::replay_hook_events_from_json(alloc_events);
+  const boost::json::array no_generators;
+  const bool has_generators = pending->registry && !entry.generators_meta.is_null();
+  restore_graph_state(*entry.graph,
+                      has_generators ? entry.generators_meta.as_array() : no_generators,
+                      entry.allocator_events.as_object(), pending->registry, index);
 
   // Reconstruct output tensors from extracted metadata
   return make_load_result_from_extracted(entry.graph, entry.output_tensors_meta, reconstruct_fn);

@@ -6,6 +6,7 @@
 #include "CUDAGraph.h"
 #include "ClusterOptIn.h"
 #include <cuda.h>
+#include <functional>
 #include <future>
 #include <variant>
 
@@ -32,6 +33,24 @@ void apply_saved_function_attributes(const std::variant<CUfunction, CUkernel>& h
                                      int preferred_shared_memory_carveout, const char* where);
 void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& params, CUdevice dev,
                                const char* where);
+
+// The parameters a loaded kernel declares (cuFuncGetParamInfo / cuKernelGetParamInfo), cached
+// per handle; nullptr when the driver does not report them. LOAD refuses archived parameters
+// that differ: the driver reads one kernelParams pointer per declared parameter, and that
+// parameter's full size from it.
+struct KernelParamInfo {
+  size_t offset;
+  size_t size;
+};
+const std::vector<KernelParamInfo>* declared_kernel_params(
+    const std::variant<CUfunction, CUkernel>& handle);
+// For a per-parameter launch: `size_of(i)` is archived parameter i's size, and the count and
+// every size must equal the declaration. A launch through 'extra' is not checked: its buffer may
+// hold less than the declared parameters (NCCL passes only the used part of its 4 KB argument
+// struct), and the driver reads the buffer's own size.
+void check_archived_kernel_params(const std::variant<CUfunction, CUkernel>& handle,
+                                  const std::string& function_name, size_t num_params,
+                                  const std::function<size_t(size_t)>& size_of);
 
 // ensure_dynamic_smem_optin + add_kernel_node_cluster_optin (ClusterOptIn.h): cuGraphAddKernelNode
 // for a restored kernel node with both function-level opt-ins the LOAD process lacks.
@@ -63,6 +82,13 @@ struct PendingGraphLoads {
   // before build_complete_ is signaled; read it only after that wait.
   std::shared_ptr<double> build_seconds_ = std::make_shared<double>(0.0);
 };
+
+// LOAD of graph `index`, in SAVE's order: register its generator states (outside the
+// allocation region), replay its allocator events, then make its RNG seed/offset tensors the
+// memory its restored kernels read (or refuse the graph when that memory is not restored).
+void restore_graph_state(CUDAGraph& graph, const boost::json::array& generators,
+                         const boost::json::object& alloc_events,
+                         CUDAGeneratorStateRegistry* registry, size_t index);
 
 // Split load: JSON parse + template build + on-demand prep (synchronous).
 // Called by CUDAGraph::start_graph_builds.

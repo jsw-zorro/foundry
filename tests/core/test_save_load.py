@@ -18,6 +18,11 @@ Workloads:
   compat       what foundry.ops takes from libtorch: Philox capture state (rand,
                dropout advance per replay), cuBLAS / cuBLASLt handle and workspace
                (preallocate_cublas_workspaces), linear with bias (cuBLASLt epilogue)
+  rng_segment  rand only, every earlier tensor larger than 1 MB: the per-capture
+               seed/offset tensors need a new small-pool segment, which SAVE
+               allocates inside the graph's recording and LOAD outside it, so
+               LOAD's tensors sit elsewhere and the restored kernels must be
+               pointed back at SAVE's (CUDAGraph.rebind_rng_state)
 Load APIs: ``load`` (CUDAGraph.load) and ``builds`` (start_graph_builds +
 finish_graph_loads). compat also runs LOAD with FOUNDRY_MMAP_ARCHIVE=0.
 The builds path maps SAVE's layout span first (``map_saved_layout`` in
@@ -110,6 +115,16 @@ def _compat_ref(x, w1, *_):
     return [torch.relu(x @ w1) * 2.0 + 1.0, None, None, None]
 
 
+def _rng_segment_inputs(g):
+    # 4 MB: the large pool only, so the default stream's small pool is empty
+    # when the capture creates its seed/offset tensors.
+    return (torch.randn(1024, 1024, generator=g).cuda(),)
+
+
+def _rng_segment(x):
+    return [torch.rand_like(x)]
+
+
 WORKLOADS = {
     "add": Workload(("sum",), _add_inputs, _add, _add, graph_region=True, mutate=True),
     "sgemm": Workload(
@@ -137,6 +152,9 @@ WORKLOADS = {
         _compat_ref,
         cublas="workspaces",
         rng=("rand", "dropout"),
+    ),
+    "rng_segment": Workload(
+        ("rand",), _rng_segment_inputs, _rng_segment, lambda x: [None], rng=("rand",)
     ),
 }
 
@@ -180,6 +198,10 @@ def _run_save(archive, workload):
 
     w = WORKLOADS[workload]
     inputs = _prefix(w)
+    if workload == "rng_segment":
+        assert torch.cuda.memory_stats().get("segment.small_pool.current", 0) == 0, (
+            "the small pool is not empty: the case does not need a new segment"
+        )
     torch.cuda.manual_seed(SEED)  # seed + philox offset 0, as a fresh LOAD state
     graph = fdry.CUDAGraph()
     with fdry.graph(graph):
@@ -232,8 +254,20 @@ def _run_load(archive, workload, load_api):
     fdry.stop_allocation_region()
 
 
+# torch < 2.13 keeps one seed/offset pair per generator, allocated at the first capture before
+# the recording starts; LOAD cannot place it at SAVE's address and refuses RNG graphs.
+_OLD_TORCH_RNG = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 13)
 CASES = [
-    pytest.param(w, api, mmap, id=f"{w}-{api}" + ("" if mmap else "-no_mmap"))
+    pytest.param(
+        w,
+        api,
+        mmap,
+        id=f"{w}-{api}" + ("" if mmap else "-no_mmap"),
+        marks=pytest.mark.skipif(
+            bool(WORKLOADS[w].rng) and _OLD_TORCH_RNG,
+            reason="torch < 2.13: LOAD cannot place the RNG state at SAVE's address",
+        ),
+    )
     for w in WORKLOADS
     for api in ("load", "builds")
     for mmap in ((True, False) if w == "compat" else (True,))
@@ -259,7 +293,9 @@ def saved(tmp_path_factory):
 @pytest.mark.parametrize("workload, load_api, mmap", CASES)
 def test_load_matches_save(saved, workload, load_api, mmap):
     env = {} if mmap else {"FOUNDRY_MMAP_ARCHIVE": "0"}
-    run_phase(__file__, "load", saved(workload), workload, load_api, env=env)
+    out = run_phase(__file__, "load", saved(workload), workload, load_api, env=env)
+    if workload == "rng_segment":
+        assert "reads its RNG seed/offset at SAVE's addresses" in out, "the RNG state was not moved"
 
 
 if __name__ == "__main__":

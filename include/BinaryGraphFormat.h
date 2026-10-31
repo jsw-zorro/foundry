@@ -3,13 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
-
-// Forward declare to avoid pulling in boost/json.hpp in the header
-namespace boost {
-namespace json {
-class value;
-}
-}  // namespace boost
+#include <vector>
 
 // Binary CUDA Graph format (.cugraph) — Version 1
 //
@@ -36,8 +30,10 @@ namespace binary_format {
 
 static constexpr uint8_t MAGIC[8] = {'C', 'U', 'G', 'R', 'A', 'P', 'H', '\0'};
 // v2: BinDependency carries CUgraphEdgeData ports/type (PDL edges).
-// v1 files remain readable (8-byte dependency records, default edges).
-static constexpr uint32_t FORMAT_VERSION = 2;
+// v3: BinGenerator carries the addresses of the RNG seed/offset tensors.
+// v1 files remain readable (8-byte dependency records, default edges); v1 and
+// v2 files have 24-byte generator records.
+static constexpr uint32_t FORMAT_VERSION = 3;
 static constexpr uint32_t MIN_SUPPORTED_VERSION = 1;
 
 enum SectionType : uint32_t {
@@ -234,12 +230,28 @@ struct BinCommonKernelAttrs {
 
 // ---- Generators ----
 
-struct BinGenerator {
+// v1/v2 record.
+struct BinGeneratorV2 {
   uint64_t id;
   uint64_t seed;
   uint64_t wholegraph_increment;
 };
-static_assert(sizeof(BinGenerator) == 24, "BinGenerator must be 24 bytes");
+static_assert(sizeof(BinGeneratorV2) == 24, "BinGeneratorV2 must be 24 bytes");
+
+// v3 record: adds the device addresses of the seed and offset tensors the
+// graph's Philox kernels read (0 when the graph draws no random numbers).
+struct BinGenerator {
+  uint64_t id;
+  uint64_t seed;
+  uint64_t wholegraph_increment;
+  uint64_t seed_ptr;
+  uint64_t offset_ptr;
+};
+static_assert(sizeof(BinGenerator) == 40, "BinGenerator must be 40 bytes");
+
+inline size_t generator_record_size(uint32_t version) {
+  return version >= 3 ? sizeof(BinGenerator) : sizeof(BinGeneratorV2);
+}
 
 // ---- Dependency ----
 
@@ -271,10 +283,6 @@ inline bool validate_header(const FileHeader& h) {
 }
 
 }  // namespace binary_format
-
-// Binary graph I/O functions
-// Returns empty json::value{} if file doesn't exist or is invalid.
-boost::json::value read_and_parse_binary_graph(const std::string& bin_path);
 
 // Lightweight binary file handle for direct-access reading.
 // Holds the file data and section pointers. No JSON construction.
@@ -315,8 +323,14 @@ struct BinaryGraphFile {
   bool valid() const { return !data.empty() && sections != nullptr; }
 };
 
+// Rename the temporary file `tmp_path` onto `path` when `written` (the stream
+// reported no error); otherwise remove it and raise.
+void commit_file(const std::string& tmp_path, const std::string& path, bool written);
+
 // Read a .cugraph file into a BinaryGraphFile (lightweight, no JSON construction).
-// Returns an invalid BinaryGraphFile if the file doesn't exist or has bad format.
+// Returns an invalid BinaryGraphFile if the file doesn't exist, has bad format,
+// or has a count, offset or range outside the file (the accessors above are
+// unchecked; every LOAD reader relies on this check).
 BinaryGraphFile read_binary_graph_file(const std::string& bin_path);
 
 }  // namespace foundry

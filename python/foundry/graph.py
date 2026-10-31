@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -194,10 +195,11 @@ def save_graph_manifest(
 
     Should be called after all graphs are captured and saved.
     """
-    graph_files = sorted(
-        (f for f in os.listdir(archive_dir) if f.startswith("graph_") and f.endswith(".json")),
-        key=lambda f: int(f.split("_")[1]),
-    )
+    # graph_<index>_<suffix>.json (not graph_manifest.json, which a second call finds).
+    numbered = (re.match(r"graph_(\d+)_.+\.json$", f) for f in os.listdir(archive_dir))
+    graph_files = [
+        m.group(0) for m in sorted(filter(None, numbered), key=lambda m: int(m.group(1)))
+    ]
     if not graph_files:
         return
 
@@ -237,7 +239,8 @@ def save_graph_manifest(
     # Strip dependencies from on-demand graph files.
     # On-demand graphs only need nodes + common_kernel_node_attrs for
     # prepare_on_demand_graph; dependencies are only used by
-    # build_graph_from_parsed (template builds).
+    # build_graph_from_parsed (template builds) and CUDAGraph.load, so a
+    # member is loaded with start_graph_builds together with its template.
     num_stripped = 0
     for filename in graph_files:
         if filename in templates:
@@ -247,8 +250,9 @@ def save_graph_manifest(
             data = json.load(f)
         if "dependencies" in data:
             del data["dependencies"]
-            with open(json_path, "w") as f:
+            with open(json_path + ".tmp", "w") as f:
                 json.dump(data, f)
+            os.replace(json_path + ".tmp", json_path)
             num_stripped += 1
 
     num_templates = len(groups)

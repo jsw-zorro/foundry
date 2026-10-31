@@ -8,9 +8,21 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_map>
+#include <unordered_set>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 
 namespace foundry {
+
+void commit_file(const std::string& tmp_path, const std::string& path, bool written) {
+  if (written && std::rename(tmp_path.c_str(), path.c_str()) == 0)
+    return;
+  const int err = errno;
+  std::remove(tmp_path.c_str());
+  TORCH_CHECK(false, "Failed to write ", path, ": ",
+              written ? std::strerror(err) : "the write did not complete");
+}
 
 void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::object& root) {
   namespace json = boost::json;
@@ -315,8 +327,12 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
   gens.reserve(generators_array.size());
   for (const auto& gen_val : generators_array) {
     const json::object& g = gen_val.as_object();
+    auto ptr = [&](const char* key) {
+      return g.contains(key) ? g.at(key).to_number<uint64_t>() : uint64_t{0};
+    };
     gens.push_back({g.at("id").to_number<uint64_t>(), g.at("seed").to_number<uint64_t>(),
-                    g.at("wholegraph_increment").to_number<uint64_t>()});
+                    g.at("wholegraph_increment").to_number<uint64_t>(), ptr("seed_ptr"),
+                    ptr("offset_ptr")});
   }
 
   // ---- JSON sections (allocator_events, output_tensors) ----
@@ -352,11 +368,11 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
   place_section(bf::SECTION_TOPOLOGY_KEY, topology_key.size());
 
   // ---- Write ----
-  std::ofstream out(bin_path, std::ios::binary);
-  if (!out.is_open()) {
-    fprintf(stderr, "[foundry] WARNING: Failed to write binary graph: %s\n", bin_path.c_str());
-    return;
-  }
+  // To a temporary name, renamed when complete: a failed write (a full disk,
+  // EIO) raises instead of leaving a truncated file that LOAD would read.
+  const std::string tmp_path = bin_path + ".tmp";
+  std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+  TORCH_CHECK(out.is_open(), "Failed to open file for writing: ", tmp_path);
 
   bf::FileHeader header = {};
   memcpy(header.magic, bf::MAGIC, 8);
@@ -407,368 +423,90 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
   write_padded(topology_key.data(), topology_key.size());
 
   out.close();
-}
-
-// ============================================================================
-// Binary reader: .cugraph -> boost::json::value
-// Reconstructs the same JSON structure that read_and_parse_graph_json produces,
-// but from binary data (no text tokenization, no hex decoding).
-// ============================================================================
-
-boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
-  namespace json = boost::json;
-  namespace bf = binary_format;
-
-  // Read entire file
-  std::ifstream in(bin_path, std::ios::binary | std::ios::ate);
-  if (!in.is_open())
-    return json::value{};
-
-  size_t file_size = in.tellg();
-  in.seekg(0);
-  std::vector<uint8_t> buf(file_size);
-  in.read(reinterpret_cast<char*>(buf.data()), file_size);
-  in.close();
-
-  const uint8_t* data = buf.data();
-
-  // Validate header
-  if (file_size < sizeof(bf::FileHeader))
-    return json::value{};
-  const bf::FileHeader& header = *reinterpret_cast<const bf::FileHeader*>(data);
-  if (!bf::validate_header(header))
-    return json::value{};
-
-  // Read section directory
-  const bf::SectionEntry* sections =
-      reinterpret_cast<const bf::SectionEntry*>(data + sizeof(bf::FileHeader));
-
-  auto section = [&](bf::SectionType type) -> std::pair<const uint8_t*, size_t> {
-    const auto& s = sections[type];
-    return {data + s.offset, s.size};
-  };
-
-  // String table
-  auto [str_data, str_size] = section(bf::SECTION_STRING_TABLE);
-
-  // Helper to get string from table
-  auto get_string = [&](uint32_t offset, uint32_t length) -> std::string {
-    return std::string(reinterpret_cast<const char*>(str_data + offset), length);
-  };
-
-  // Helper to hex-encode binary data (for JSON compatibility with downstream)
-  auto hex_encode = [](const uint8_t* bytes, size_t len) -> std::string {
-    static const char hex_chars[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(len * 2);
-    for (size_t i = 0; i < len; i++) {
-      result.push_back(hex_chars[bytes[i] >> 4]);
-      result.push_back(hex_chars[bytes[i] & 0x0f]);
-    }
-    return result;
-  };
-
-  // Node table
-  auto [node_data, node_size] = section(bf::SECTION_NODE_TABLE);
-  const bf::BinNodeEntry* node_entries = reinterpret_cast<const bf::BinNodeEntry*>(node_data);
-
-  // Param index and data
-  auto [pi_data, pi_size] = section(bf::SECTION_KERNEL_PARAM_INDEX);
-  auto [pd_data, pd_size] = section(bf::SECTION_KERNEL_PARAM_DATA);
-  auto [ab_data, ab_size] = section(bf::SECTION_ARG_BUFFER_DATA);
-
-  // Common kernel attrs
-  bf::BinCommonKernelAttrs common_attrs = {};
-  bool has_common = header.flags & bf::FLAG_HAS_COMMON_KERNEL_ATTRS;
-  if (has_common) {
-    auto [ca_data, ca_size] = section(bf::SECTION_COMMON_KERNEL_ATTRS);
-    if (ca_size >= sizeof(bf::BinCommonKernelAttrs)) {
-      common_attrs = *reinterpret_cast<const bf::BinCommonKernelAttrs*>(ca_data);
-    }
-  }
-
-  // Helper to build kernel_node_attrs JSON from binary flags
-  auto build_kna_json = [](const bf::BinKernelNode& k) -> json::object {
-    json::object kna;
-    if (k.kna_flags & bf::KNA_ATTR_QUERY_AVAILABLE)
-      kna["attrQueryAvailable"] = (bool)k.kna_attrQueryAvailable;
-    if (k.kna_flags & bf::KNA_CLUSTER_DIM) {
-      kna["clusterDimX"] = k.kna_clusterDimX;
-      kna["clusterDimY"] = k.kna_clusterDimY;
-      kna["clusterDimZ"] = k.kna_clusterDimZ;
-    }
-    if (k.kna_flags & bf::KNA_PREFERRED_CLUSTER_DIM) {
-      kna["preferredClusterDimX"] = k.kna_preferredClusterDimX;
-      kna["preferredClusterDimY"] = k.kna_preferredClusterDimY;
-      kna["preferredClusterDimZ"] = k.kna_preferredClusterDimZ;
-    }
-    if (k.kna_flags & bf::KNA_CLUSTER_SCHEDULING)
-      kna["clusterSchedulingPolicyPreference"] = k.kna_clusterSchedulingPolicy;
-    if (k.kna_flags & bf::KNA_COOPERATIVE)
-      kna["cooperative"] = k.kna_cooperative;
-    if (k.kna_flags & bf::KNA_PRIORITY)
-      kna["priority"] = k.kna_priority;
-    if (k.kna_flags & bf::KNA_MEM_SYNC_DOMAIN)
-      kna["memSyncDomain"] = k.kna_memSyncDomain;
-    if (k.kna_flags & bf::KNA_MEM_SYNC_DOMAIN_MAP) {
-      kna["memSyncDomainMapDefault"] = (int)k.kna_memSyncDomainMapDefault;
-      kna["memSyncDomainMapRemote"] = (int)k.kna_memSyncDomainMapRemote;
-    }
-    if (k.kna_flags & bf::KNA_SHARED_MEM_CARVEOUT)
-      kna["preferredSharedMemCarveout"] = k.kna_preferredSharedMemCarveout;
-    if (k.ext_flags & bf::KNX_PROGRAMMATIC_STREAM_SERIALIZATION)
-      kna["programmaticStreamSerialization"] = (int)k.ext_programmatic_stream_serialization;
-    if (k.ext_flags & bf::KNX_DEVICE_UPDATABLE)
-      kna["deviceUpdatable"] = (int)k.ext_device_updatable;
-    return kna;
-  };
-
-  // ---- Build JSON nodes array ----
-  json::array nodes_array;
-  nodes_array.reserve(header.num_nodes);
-
-  for (uint32_t i = 0; i < header.num_nodes; i++) {
-    const bf::BinNodeEntry& entry = node_entries[i];
-    json::object node_obj;
-    node_obj["id"] = entry.node_id;
-
-    switch (entry.type) {
-      case bf::NODE_KERNEL: {
-        node_obj["type"] = "KernelNode";
-        const auto& k = entry.kernel;
-        json::object params;
-
-        params["blockDimX"] = k.blockDimX;
-        params["blockDimY"] = k.blockDimY;
-        params["blockDimZ"] = k.blockDimZ;
-        params["gridDimX"] = k.gridDimX;
-        params["gridDimY"] = k.gridDimY;
-        params["gridDimZ"] = k.gridDimZ;
-        params["sharedMemBytes"] = k.sharedMemBytes;
-
-        params["function_name"] = get_string(k.function_name_offset, k.function_name_length);
-        params["kernel_source_binary_hash"] = k.binary_hash;
-
-        // func_attrs
-        json::object func_attrs;
-        func_attrs["max_dynamic_shared_size_bytes"] = k.max_dynamic_shared_size_bytes;
-        func_attrs["preferred_shared_memory_carveout"] = k.preferred_shared_memory_carveout;
-        func_attrs["cluster_scheduling_policy_preference"] = k.cluster_scheduling_policy_preference;
-        func_attrs["required_cluster_width"] = k.required_cluster_width;
-        func_attrs["required_cluster_height"] = k.required_cluster_height;
-        func_attrs["required_cluster_depth"] = k.required_cluster_depth;
-        params["func_attrs"] = func_attrs;
-
-        // kernel_node_attrs
-        params["kernel_node_attrs"] = build_kna_json(k);
-
-        // Kernel params
-        json::array kp_array;
-        const bf::BinParamEntry* param_entries =
-            reinterpret_cast<const bf::BinParamEntry*>(pi_data + k.param_index_offset);
-
-        if (k.arg_buffer_offset != 0xFFFFFFFF) {
-          // Extra-style params (metadata only, data in arg buffer)
-          for (uint32_t j = 0; j < k.num_params; j++) {
-            json::object kp;
-            kp["index"] = (int)j;
-            kp["offset"] = param_entries[j].data_offset;
-            kp["size"] = param_entries[j].size;
-            kp_array.push_back(kp);
-          }
-
-          // Reconstruct extra_argBuffer_hex from binary
-          params["extra_argBuffer_hex"] =
-              hex_encode(ab_data + k.arg_buffer_offset, k.arg_buffer_size);
-
-          json::array extra;
-          extra.push_back("CU_LAUNCH_PARAM_BUFFER_POINTER");
-          extra.push_back("null");
-          extra.push_back("CU_LAUNCH_PARAM_BUFFER_SIZE");
-          extra.push_back((uint64_t)k.arg_buffer_size);
-          extra.push_back("CU_LAUNCH_PARAM_END");
-          params["extra"] = extra;
-        } else {
-          // Per-param hex data style
-          for (uint32_t j = 0; j < k.num_params; j++) {
-            json::object kp;
-            kp["index"] = (int)j;
-            kp["offset"] = param_entries[j].data_offset;
-            kp["size"] = param_entries[j].size;
-            kp["value_hex"] =
-                hex_encode(pd_data + param_entries[j].data_offset, param_entries[j].size);
-            kp_array.push_back(kp);
-          }
-          params["extra"] = json::array{};
-          params["extra_argBuffer_hex"] = "";
-        }
-        params["kernelParams"] = kp_array;
-
-        node_obj["params"] = params;
-        break;
-      }
-      case bf::NODE_MEMCPY: {
-        node_obj["type"] = "MemcpyNode";
-        const auto& m = entry.memcpy;
-        json::object params;
-        params["Depth"] = m.Depth;
-        params["Height"] = m.Height;
-        params["WidthInBytes"] = m.WidthInBytes;
-        params["dstDevice"] = m.dstDevice;
-        params["dstHeight"] = m.dstHeight;
-        params["dstLOD"] = m.dstLOD;
-        params["dstMemoryType"] = m.dstMemoryType;
-        params["dstPitch"] = m.dstPitch;
-        params["dstXInBytes"] = m.dstXInBytes;
-        params["dstY"] = m.dstY;
-        params["dstZ"] = m.dstZ;
-        params["srcDevice"] = m.srcDevice;
-        params["srcHeight"] = m.srcHeight;
-        params["srcLOD"] = m.srcLOD;
-        params["srcMemoryType"] = m.srcMemoryType;
-        params["srcPitch"] = m.srcPitch;
-        params["srcXInBytes"] = m.srcXInBytes;
-        params["srcY"] = m.srcY;
-        params["srcZ"] = m.srcZ;
-        node_obj["params"] = params;
-        break;
-      }
-      case bf::NODE_MEMSET: {
-        node_obj["type"] = "MemsetNode";
-        const auto& m = entry.memset;
-        json::object params;
-        params["dst"] = m.dst;
-        params["elementSize"] = m.elementSize;
-        params["height"] = m.height;
-        params["pitch"] = m.pitch;
-        params["value"] = m.value;
-        params["width"] = m.width;
-        node_obj["params"] = params;
-        break;
-      }
-      case bf::NODE_EVENT_RECORD:
-        node_obj["type"] = "EventRecordNode";
-        node_obj["params"] = json::object{{"event_id", entry.event.event_id}};
-        break;
-      case bf::NODE_EVENT_WAIT:
-        node_obj["type"] = "EventWaitNode";
-        node_obj["params"] = json::object{{"event_id", entry.event.event_id}};
-        break;
-      case bf::NODE_EMPTY:
-        node_obj["type"] = "EmptyNode";
-        node_obj["params"] = json::object{};
-        break;
-    }
-
-    nodes_array.push_back(std::move(node_obj));
-  }
-
-  // ---- Build root JSON object ----
-  json::object root;
-  root["nodes"] = std::move(nodes_array);
-
-  // Topology key
-  auto [tk_data, tk_size] = section(bf::SECTION_TOPOLOGY_KEY);
-  root["topology_key"] = std::string(reinterpret_cast<const char*>(tk_data), tk_size);
-
-  // Common kernel attrs
-  if (has_common) {
-    // Build from the BinCommonKernelAttrs using a fake BinKernelNode
-    bf::BinKernelNode fake = {};
-    fake.kna_flags = common_attrs.flags;
-    fake.kna_clusterDimX = common_attrs.clusterDimX;
-    fake.kna_clusterDimY = common_attrs.clusterDimY;
-    fake.kna_clusterDimZ = common_attrs.clusterDimZ;
-    fake.kna_preferredClusterDimX = common_attrs.preferredClusterDimX;
-    fake.kna_preferredClusterDimY = common_attrs.preferredClusterDimY;
-    fake.kna_preferredClusterDimZ = common_attrs.preferredClusterDimZ;
-    fake.kna_clusterSchedulingPolicy = common_attrs.clusterSchedulingPolicy;
-    fake.kna_cooperative = common_attrs.cooperative;
-    fake.kna_priority = common_attrs.priority;
-    fake.kna_memSyncDomain = common_attrs.memSyncDomain;
-    fake.kna_memSyncDomainMapDefault = common_attrs.memSyncDomainMapDefault;
-    fake.kna_memSyncDomainMapRemote = common_attrs.memSyncDomainMapRemote;
-    fake.kna_attrQueryAvailable = common_attrs.attrQueryAvailable;
-    fake.kna_preferredSharedMemCarveout = common_attrs.preferredSharedMemCarveout;
-    root["common_kernel_node_attrs"] = build_kna_json(fake);
-  }
-
-  // Dependencies
-  if (header.flags & bf::FLAG_HAS_DEPENDENCIES) {
-    auto [dep_data, dep_size] = section(bf::SECTION_DEPENDENCY_TABLE);
-    json::array deps_array;
-    deps_array.reserve(header.num_dependencies);
-    if (header.version >= 2) {
-      const bf::BinDependency* deps = reinterpret_cast<const bf::BinDependency*>(dep_data);
-      for (uint32_t i = 0; i < header.num_dependencies; i++) {
-        json::object d;
-        d["from"] = deps[i].from_id;
-        d["to"] = deps[i].to_id;
-        if (deps[i].from_port != 0) {
-          d["from_port"] = deps[i].from_port;
-        }
-        if (deps[i].to_port != 0) {
-          d["to_port"] = deps[i].to_port;
-        }
-        if (deps[i].edge_type != 0) {
-          d["edge_type"] = deps[i].edge_type;
-        }
-        deps_array.push_back(d);
-      }
-    } else {
-      // v1: 8-byte records, default edges only.
-      const bf::BinDependencyV1* deps = reinterpret_cast<const bf::BinDependencyV1*>(dep_data);
-      for (uint32_t i = 0; i < header.num_dependencies; i++) {
-        json::object d;
-        d["from"] = deps[i].from_id;
-        d["to"] = deps[i].to_id;
-        deps_array.push_back(d);
-      }
-    }
-    root["dependencies"] = std::move(deps_array);
-  }
-
-  // Generators
-  if (header.flags & bf::FLAG_HAS_GENERATORS) {
-    auto [gen_data, gen_size] = section(bf::SECTION_GENERATORS_TABLE);
-    const bf::BinGenerator* gens = reinterpret_cast<const bf::BinGenerator*>(gen_data);
-    json::array gens_array;
-    gens_array.reserve(header.num_generators);
-    for (uint32_t i = 0; i < header.num_generators; i++) {
-      json::object g;
-      g["id"] = gens[i].id;
-      g["seed"] = gens[i].seed;
-      g["wholegraph_increment"] = gens[i].wholegraph_increment;
-      gens_array.push_back(g);
-    }
-    root["generators"] = std::move(gens_array);
-  } else {
-    root["generators"] = json::array{};
-  }
-
-  // Allocator events (embedded JSON text)
-  if (header.flags & bf::FLAG_HAS_ALLOCATOR_EVENTS) {
-    auto [ae_data, ae_size] = section(bf::SECTION_ALLOCATOR_EVENTS);
-    std::string ae_str(reinterpret_cast<const char*>(ae_data), ae_size);
-    root["allocator_events"] = json::parse(ae_str);
-  } else {
-    root["allocator_events"] = json::object{};
-  }
-
-  // Output tensors (embedded JSON text)
-  if (header.flags & bf::FLAG_HAS_OUTPUT_TENSORS) {
-    auto [ot_data, ot_size] = section(bf::SECTION_OUTPUT_TENSORS);
-    std::string ot_str(reinterpret_cast<const char*>(ot_data), ot_size);
-    root["output_tensors"] = json::parse(ot_str);
-  }
-
-  return json::value(std::move(root));
+  commit_file(tmp_path, bin_path, !out.fail());
 }
 
 // ============================================================================
 // Lightweight binary reader: just reads file + validates header.
 // No JSON construction. Used for direct-access in prepare_on_demand_graph.
 // ============================================================================
+
+// Every count, offset and range that LOAD reads from a .cugraph, checked against
+// the file. Returns the first problem found, or an empty string.
+static std::string check_binary_graph_file(const BinaryGraphFile& f) {
+  namespace bf = binary_format;
+  const uint64_t file_size = f.data.size();
+  const bf::FileHeader& h = f.header;
+  if (h.num_sections < bf::SECTION_COUNT)
+    return "the section directory has " + std::to_string(h.num_sections) + " entries";
+  if (sizeof(bf::FileHeader) + uint64_t(h.num_sections) * sizeof(bf::SectionEntry) > file_size)
+    return "the section directory extends past the end of the file";
+  for (uint32_t t = 0; t < bf::SECTION_COUNT; ++t) {
+    const bf::SectionEntry& s = f.sections[t];
+    if (s.offset > file_size || s.size > file_size - s.offset)
+      return "section " + std::to_string(t) + " extends past the end of the file";
+  }
+  auto in_range = [&](bf::SectionType t, uint64_t offset, uint64_t length) {
+    const uint64_t size = f.section_size(t);
+    return offset <= size && length <= size - offset;
+  };
+  const uint64_t dep_record =
+      h.version >= 2 ? sizeof(bf::BinDependency) : sizeof(bf::BinDependencyV1);
+  if (!in_range(bf::SECTION_NODE_TABLE, 0, uint64_t(h.num_nodes) * sizeof(bf::BinNodeEntry)))
+    return "the node table is shorter than its " + std::to_string(h.num_nodes) + " nodes";
+  if (!in_range(bf::SECTION_DEPENDENCY_TABLE, 0, uint64_t(h.num_dependencies) * dep_record))
+    return "the dependency table is shorter than its " + std::to_string(h.num_dependencies) +
+           " records";
+  if (!in_range(bf::SECTION_GENERATORS_TABLE, 0,
+                uint64_t(h.num_generators) * bf::generator_record_size(h.version)))
+    return "the generator table is shorter than its " + std::to_string(h.num_generators) +
+           " records";
+  if ((h.flags & bf::FLAG_HAS_COMMON_KERNEL_ATTRS) &&
+      !in_range(bf::SECTION_COMMON_KERNEL_ATTRS, 0, sizeof(bf::BinCommonKernelAttrs)))
+    return "the common kernel attributes are truncated";
+
+  std::unordered_set<uint32_t> ids;
+  ids.reserve(h.num_nodes);
+  const bf::BinNodeEntry* nodes = f.node_table();
+  for (uint32_t i = 0; i < h.num_nodes; ++i) {
+    const bf::BinNodeEntry& e = nodes[i];
+    const std::string node = "node " + std::to_string(i);
+    if (e.type > bf::NODE_EMPTY)
+      return node + " has unknown type " + std::to_string(e.type);
+    if (!ids.insert(e.node_id).second)
+      return node + " repeats node id " + std::to_string(e.node_id);
+    if (e.type != bf::NODE_KERNEL)
+      continue;
+    const bf::BinKernelNode& k = e.kernel;
+    if (!in_range(bf::SECTION_STRING_TABLE, k.function_name_offset, k.function_name_length))
+      return node + ": the function name is outside the string table";
+    if (!in_range(bf::SECTION_KERNEL_PARAM_INDEX, k.param_index_offset,
+                  uint64_t(k.num_params) * sizeof(bf::BinParamEntry)))
+      return node + ": the parameter list is outside the parameter index";
+    if (k.arg_buffer_offset != 0xFFFFFFFF) {
+      // Extra-style launch: the parameters are offsets into this buffer.
+      if (!in_range(bf::SECTION_ARG_BUFFER_DATA, k.arg_buffer_offset, k.arg_buffer_size))
+        return node + ": the argument buffer is outside its section";
+      continue;
+    }
+    const auto* params = reinterpret_cast<const bf::BinParamEntry*>(
+        f.section_ptr<uint8_t>(bf::SECTION_KERNEL_PARAM_INDEX) + k.param_index_offset);
+    for (uint32_t j = 0; j < k.num_params; ++j) {
+      if (!in_range(bf::SECTION_KERNEL_PARAM_DATA, params[j].data_offset, params[j].size))
+        return node + ": parameter " + std::to_string(j) + " is outside the parameter data";
+    }
+  }
+
+  const uint8_t* deps = f.section_ptr<uint8_t>(bf::SECTION_DEPENDENCY_TABLE);
+  for (uint32_t i = 0; i < h.num_dependencies; ++i) {
+    // from_id and to_id lead both record versions.
+    bf::BinDependencyV1 d;
+    memcpy(&d, deps + i * dep_record, sizeof(d));
+    if (!ids.count(d.from_id) || !ids.count(d.to_id))
+      return "dependency " + std::to_string(i) + " names a node that is not in the node table";
+  }
+  return "";
+}
 
 BinaryGraphFile read_binary_graph_file(const std::string& bin_path) {
   namespace bf = binary_format;
@@ -778,13 +516,20 @@ BinaryGraphFile read_binary_graph_file(const std::string& bin_path) {
   if (!in.is_open())
     return result;
 
-  size_t file_size = in.tellg();
-  if (file_size < sizeof(bf::FileHeader))
+  const std::streamoff end = in.tellg();
+  if (end < static_cast<std::streamoff>(sizeof(bf::FileHeader)))
     return result;
+  const size_t file_size = static_cast<size_t>(end);
 
   in.seekg(0);
   result.data.resize(file_size);
   in.read(reinterpret_cast<char*>(result.data.data()), file_size);
+  if (static_cast<size_t>(in.gcount()) != file_size) {
+    fprintf(stderr, "[foundry] WARNING: %s: read %lld of %zu bytes; LOAD uses the JSON\n",
+            bin_path.c_str(), static_cast<long long>(in.gcount()), file_size);
+    result.data.clear();
+    return result;
+  }
   in.close();
 
   memcpy(&result.header, result.data.data(), sizeof(bf::FileHeader));
@@ -795,7 +540,15 @@ BinaryGraphFile read_binary_graph_file(const std::string& bin_path) {
 
   result.sections =
       reinterpret_cast<const bf::SectionEntry*>(result.data.data() + sizeof(bf::FileHeader));
-
+  const std::string problem = check_binary_graph_file(result);
+  if (!problem.empty()) {
+    // A damaged binary (for example a copy cut short) is not used; the graph
+    // is read from its JSON.
+    fprintf(stderr, "[foundry] WARNING: %s: %s; LOAD uses the JSON\n", bin_path.c_str(),
+            problem.c_str());
+    result.data.clear();
+    result.sections = nullptr;
+  }
   return result;
 }
 

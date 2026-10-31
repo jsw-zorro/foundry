@@ -19,12 +19,28 @@ line must say cudagraph-patch when cgp_exec_update resolves in this process
 A second workload (needs Triton) launches one Triton kernel with two BLOCK
 specializations: same function name and DAG, different binary. Share mode
 must split the saved group into one template per binary.
+
+A third workload copies the first n rows of the input into a persistent
+buffer: one device-to-device memcpy node whose size differs per member. Every
+replay must write exactly n rows (the buffer is filled with -1 before each
+replay, so a copy of the template's size shows in the rows past n). It saves
+the largest size first, as sglang does, so every member is smaller than its
+template; so do the fourth and fifth.
+
+A fourth workload (needs nvcc and sm90+) launches a kernel in 2-CTA clusters
+with 2n blocks, each marking its own entry of a persistent buffer: the grid of
+a clustered kernel node differs per member, and every replay must mark exactly
+2n entries. Share mode gives each graph of these two workloads its own template
+(members whose copy extents or clustered launch dims differ are not switched).
+A fifth one launches a producer and a consumer joined by a programmatic (PDL)
+edge, whose members are switched.
 """
 
 import ctypes
 import json
 import os
 import re
+import shutil
 import statistics
 import sys
 import time
@@ -65,6 +81,9 @@ PHASE2_RE = re.compile(
     r"\(members: (\d+) execs instantiated"
 )
 REFINE_RE = re.compile(r"\[foundry\] exec share: (\d+) saved groups -> (\d+) templates")
+if os.environ.get(WORKLOAD_ENV) in ("memcpy", "cluster", "pdl"):
+    # Largest first, as sglang captures: every member is smaller than its template.
+    SIZES = SIZES[::-1]
 
 
 def _body(x, n):
@@ -100,14 +119,128 @@ def _body_triton(x, n):
     return y
 
 
+_dst: torch.Tensor | None = None  # memcpy / cluster workloads: the persistent destination
+
+_CLUSTER_SOURCE = r"""
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+__global__ void foundry_test_mark(float* out) {
+  if (threadIdx.x == 0) out[blockIdx.x] = 1.0f;
+}
+
+void launch_clustered(torch::Tensor out, int64_t blocks) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(static_cast<unsigned>(blocks));
+  cfg.blockDim = dim3(32);
+  cfg.stream = at::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeClusterDimension;
+  attr[0].val.clusterDim.x = 2;
+  attr[0].val.clusterDim.y = 1;
+  attr[0].val.clusterDim.z = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  TORCH_CHECK(cudaLaunchKernelEx(&cfg, foundry_test_mark, out.data_ptr<float>()) == cudaSuccess);
+}
+"""
+_cluster_ext = None
+
+# Programmatic dependent launch: the producer marks 2n entries and triggers its dependent early;
+# the consumer (launched with programmatic stream serialization) waits for the producer's
+# memory with cudaGridDependencySynchronize and doubles every entry it finds marked.
+_PDL_SOURCE = r"""
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+__global__ void foundry_test_produce(float* out) {
+  cudaTriggerProgrammaticLaunchCompletion();
+  // Some work after the trigger, so a dependent released too early reads stale entries.
+  float v = 1.0f;
+  for (int k = 0; k < 2000; ++k) v = v * 0.999999f + 0.000001f;
+  if (threadIdx.x == 0) out[blockIdx.x] = v > 0.0f ? 1.0f : 0.0f;
+}
+
+__global__ void foundry_test_consume(float* out) {
+  cudaGridDependencySynchronize();
+  if (threadIdx.x == 0 && out[blockIdx.x] == 1.0f) out[blockIdx.x] = 2.0f;
+}
+
+void launch_pdl(torch::Tensor out, int64_t blocks) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  foundry_test_produce<<<static_cast<unsigned>(blocks), 32, 0, stream>>>(out.data_ptr<float>());
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(static_cast<unsigned>(blocks));
+  cfg.blockDim = dim3(32);
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  TORCH_CHECK(cudaLaunchKernelEx(&cfg, foundry_test_consume, out.data_ptr<float>()) == cudaSuccess);
+}
+"""
+_pdl_ext = None
+
+
+def _extension(archive, name, source, function):
+    from torch.utils.cpp_extension import load_inline
+
+    build = os.path.join(os.path.dirname(archive), "ext")
+    os.makedirs(build, exist_ok=True)
+    return load_inline(
+        name,
+        cpp_sources=f"void {function}(torch::Tensor out, int64_t blocks);",
+        cuda_sources=source,
+        functions=[function],
+        build_directory=build,
+        verbose=False,
+    )
+
+
+def _body_memcpy(x, n):
+    _dst[:n].copy_(x[:n])
+    return _dst
+
+
+def _body_cluster(x, n):
+    _cluster_ext.launch_clustered(_dst, 2 * n)
+    return _dst
+
+
+def _body_pdl(x, n):
+    _pdl_ext.launch_pdl(_dst, 2 * n)
+    return _dst
+
+
+def _before_replay():
+    if _dst is not None:
+        _dst.fill_(-1.0)
+
+
 def _workload_body():
-    return _body_triton if os.environ.get(WORKLOAD_ENV) == "triton" else _body
+    workload = os.environ.get(WORKLOAD_ENV)
+    bodies = {
+        "triton": _body_triton,
+        "memcpy": _body_memcpy,
+        "cluster": _body_cluster,
+        "pdl": _body_pdl,
+    }
+    return bodies.get(workload, _body)
 
 
 def _prefix():
     """Identical in SAVE and LOAD: the VMM cursor and the caching allocator."""
+    global _dst
     g, stream = prefix_region(BASE_ADDR, REGION_SIZE_STR)
     x = torch.randn(max(SIZES), HIDDEN, generator=g).cuda()
+    if os.environ.get(WORKLOAD_ENV) == "memcpy":
+        _dst = torch.full_like(x, -1.0)
+    elif os.environ.get(WORKLOAD_ENV) in ("cluster", "pdl"):
+        _dst = torch.full((2 * max(SIZES),), -1.0, device="cuda")
     body = _workload_body()
     with torch.cuda.stream(stream):
         for n in SIZES if body is _body_triton else SIZES[:1]:
@@ -121,9 +254,20 @@ def _graph_paths(archive):
     return [os.path.join(archive, f"graph_{i}_bs{n}.json") for i, n in enumerate(SIZES)]
 
 
+def _load_workload_extension(archive):
+    global _cluster_ext, _pdl_ext
+    if os.environ.get(WORKLOAD_ENV) == "cluster":
+        _cluster_ext = _extension(
+            archive, "foundry_test_exec_share_cluster", _CLUSTER_SOURCE, "launch_clustered"
+        )
+    elif os.environ.get(WORKLOAD_ENV) == "pdl":
+        _pdl_ext = _extension(archive, "foundry_test_exec_share_pdl", _PDL_SOURCE, "launch_pdl")
+
+
 def _run_save(archive):
     import foundry as fdry
 
+    _load_workload_extension(archive)
     x = _prefix()
     body = _workload_body()
     graphs, outs = [], []
@@ -131,9 +275,10 @@ def _run_save(archive):
         graph = fdry.CUDAGraph()
         with fdry.graph(graph):
             out = body(x, n)
+        _before_replay()
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(out, body(x, n))
+        torch.testing.assert_close(out.clone(), body(x, n))
         graph.save(path, output_tensors=out)
         graphs.append(graph)
         outs.append(out.cpu().clone())
@@ -161,6 +306,7 @@ def _run_load(archive):
     import foundry as fdry
 
     mode = "share" if os.environ.get(SHARE_ENV) == "1" else "eager"
+    _load_workload_extension(archive)
     fdry.load_cuda_modules_and_libraries("hook_archive")
     x = _prefix()
     ref_outs = load_reference(archive, [x])
@@ -174,6 +320,7 @@ def _run_load(archive):
 
     replays = []
     for i in ORDER:
+        _before_replay()
         graphs[i].replay()
         torch.cuda.synchronize()
         got = outs[i].cpu().clone()
@@ -221,11 +368,15 @@ def _stats(log):
     return json.loads(line.split(" ", 1)[1])
 
 
-@pytest.fixture(scope="module", params=["elementwise", "triton"])
+@pytest.fixture(scope="module", params=["elementwise", "triton", "memcpy", "cluster", "pdl"])
 def runs(request, tmp_path_factory):
     workload = request.param
     if workload == "triton" and not _HAS_TRITON:
         pytest.skip("triton not installed")
+    if workload in ("cluster", "pdl") and (
+        shutil.which("nvcc") is None or torch.cuda.get_device_capability()[0] < 9
+    ):
+        pytest.skip("CUDA toolkit and sm90+ required")
     work = tmp_path_factory.mktemp(f"exec_share_{workload}")
     _spawn("save", work, workload=workload)
     assert (work / "hook_archive").is_dir(), "SAVE did not pack hook_archive"
@@ -246,10 +397,19 @@ def test_eager_instantiates_every_member(runs):
     assert all(not s["enabled"] for s in _stats(eager)["execs"])
 
 
+# Workloads whose members differ from the template in copy extents or clustered launch dims:
+# share mode gives each graph its own template.
+_SPLIT_WORKLOADS = ("exec_share_memcpy", "exec_share_cluster")
+
+
 def test_share_instantiates_templates_only(runs):
-    _, _, share = runs
+    work, _, share = runs
     templates, members, total, member_execs = _phase2(share)
     assert total == len(SIZES)
+    if work.name.startswith(_SPLIT_WORKLOADS):
+        assert (templates, members) == (len(SIZES), 0), (templates, members)
+        assert REFINE_RE.search(share).groups() == ("1", str(len(SIZES)))
+        return
     assert members > 0, "share mode refined every group to one graph; no switch tested"
     assert member_execs == 0
     assert "[foundry] exec share:" in share
@@ -261,7 +421,7 @@ def test_share_instantiates_templates_only(runs):
 
 def test_share_splits_kernel_binaries(runs):
     work, eager, share = runs
-    if work.name.startswith("exec_share_elementwise"):
+    if not work.name.startswith("exec_share_triton"):
         pytest.skip("Triton workload only")
     assert _phase2(eager)[0] == 1, "eager keeps the saved group"
     m = REFINE_RE.search(share)

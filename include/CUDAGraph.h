@@ -79,6 +79,15 @@ struct CUDAGraph {
 
   void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state);
   void register_generator_state(const at::Generator& generator);
+  // Device addresses of the seed and offset tensors this graph's Philox
+  // kernels read for `state` ({0, 0} when it has none).
+  std::pair<uintptr_t, uintptr_t> rng_state_addresses(
+      const c10::intrusive_ptr<at::CUDAGeneratorState>& state) const;
+  // LOAD: make this graph's seed and offset tensors for `state` the memory at
+  // these addresses (the restored kernels read there). False when this torch
+  // keeps one pair per generator state (torch < 2.13).
+  bool rebind_rng_state(const c10::intrusive_ptr<at::CUDAGeneratorState>& state, uintptr_t seed_ptr,
+                        uintptr_t offset_ptr);
   void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state,
                                 uint64_t wholegraph_increment);
   void capture_begin(MempoolId_t pool = {0, 0},
@@ -174,6 +183,10 @@ struct CUDAGraph {
     std::mutex replay_mutex;
     uint64_t updates = 0;
     uint64_t rewrite_ns = 0, update_ns = 0, upload_ns = 0;
+    // Per node: kernel-node attributes a rewrite may have left non-zero on the
+    // builder graph (bits in CUDAGraph.cpp); every bit until a rewrite has read
+    // the node (apply_on_demand_updates).
+    std::vector<uint8_t> attrs_maybe_set;
 
     ~SharedGraphExec();
   };
