@@ -185,6 +185,6 @@ On Qwen3-1.7B (FlashInfer, prefill 8-64 + decode 1-8, one H200) Phase 2 took ~11
 so the restore is tens of milliseconds per runner, while the loops take ~1.1 s (prefill, which also runs the run-once
 `warmup()`) and ~0.7 s (decode).
 
-An archive saved by older code (no `capture_loop_version` in `region_layout.json`) is refused at setup, before the
-weights load: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the current code`.
-Re-run both SAVE passes.
+An archive saved by older code (`capture_loop_version` other than 3 in `region_layout.json`, or none) is refused at
+setup, before the weights load: `Foundry archive ... has capture_loop_version=2, this code needs 3: re-SAVE with the
+current code`. Re-run SAVE.

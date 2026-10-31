@@ -22,8 +22,9 @@ Graphs captured for different batch sizes of the same model almost always have
 the same structure: the same kernels in the same order with the same
 dependency DAG and the same cluster dimensions, differing only in kernel
 parameters (grid sizes, pointers, scalars). SAVE groups graphs by a topology
-key (node types + cluster dims, `save_graph_manifest`; prefill and decode
-graphs are kept in separate groups) and records one **template** per group
+key (node types, cluster dims and a hash of the dependency edges with their
+ports and types; `save_graph_manifest`; prefill and decode graphs are kept in
+separate groups) and records one **template** per group
 plus the per-node parameter sets of every other **member**. A 256-graph
 capture typically yields 12-37 groups.
 
@@ -82,7 +83,15 @@ can be switched freely between runs of the same archive.
 
 **Eager** (default). In Phase 2 each member's parameters are written onto the
 builder graph and a new exec is instantiated from it (~5 ms per ~1000-node
-graph), plus the exec-pool prewarm. Execs are snapshots, so the template's
+graph), plus the exec-pool prewarm. SAVE records the preferred cluster dims,
+cluster scheduling policy, cooperative flag, priority, memory-sync domain and
+domain map and shared-memory carveout of a kernel node only when they are not
+zero; when a member does not record one of them it is reset to zero on the
+builder node, so the member does not keep the template's or an earlier member's
+value. Programmatic stream serialization, the access policy window and the
+device-updatable flag are not rewritten for members (see
+[`sglang/graph-state-checklist-driver.md`](sglang/graph-state-checklist-driver.md)).
+Execs are snapshots, so the template's
 exec and earlier members' execs are untouched. A replay is one
 `cudaGraphLaunch` of the member's own exec and runs at the speed of a natively
 captured graph (TPOT within noise, PDL edges preserved per
@@ -93,9 +102,11 @@ as in native capture: 256 execs cost ~1.1 s of Phase 2 and ~1 GB of exec memory.
 the template execs only: no prewarm, no member exec. Groups are first refined
 by their full dependency table and, per kernel node, binary hash (an update
 carries a switch to another function of the same binary, not to another binary
-of the same function, e.g. a different Triton specialization), and a member
-whose cluster dims differ from its
-template is rejected. A replay of a different member than the previous one
+of the same function, e.g. a different Triton specialization), effective
+cluster and preferred-cluster dims and the cooperative flag (attributes an
+update does not carry), and, since 2026-10-28, by memcpy and memset extents and
+the launch dims of clustered kernels: such members get their own template (see
+[`sglang/known-issues.md`](sglang/known-issues.md) for why). A replay of a different member than the previous one
 rewrites the builder graph's parameters, `cuGraphExecUpdate`s the template's
 exec and uploads it (host only, no synchronization); a replay of the same
 member launches directly. Memory is one exec per template. An updated exec

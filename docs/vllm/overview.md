@@ -105,7 +105,7 @@ vLLM's lifecycle splits across the engine-core process and worker processes. Fou
 3. `_initialize_kv_caches` reads saved state, skips profile forward.
 4. `_load_model_with_overlap`: `do_original_load` runs first (weight IO + `process_weights_after_loading` + `prepare_communication_buffer_for_model`), then `start_graph_builds` kicks off background template construction so it overlaps with the cheaper post-load init work that follows (KV cache setup, scheduler bring-up). The order was reversed in an earlier design; running the templates against the weight load itself caused driver contention.
 5. The post-orig hook on `prepare_communication_buffer_for_model` flushes `init_nvshmem_for_loaded_modules` once the NVSHMEM runtime is bootstrapped.
-6. `capture_model` runs the upstream capture loop. `cudagraph_num_of_warmups` was already forced to 0 by `install_hooks`, so no asymmetric warmup forward fires.
+6. `capture_model` runs the upstream capture loop. `cudagraph_num_of_warmups` is forced to 0 by `install_hooks` and again by the patched `capture_model` (a forked worker inherits the hooks without running `install_hooks`' config fixups), so no asymmetric warmup forward fires.
 7. `CUDAGraphWrapper.__call__` enters LOAD mode and calls `FoundryCUDAGraph.finish_one_graph_load(pending, index)` per batch, interleaving allocator-event replay with the loop's between-capture work so the VMM cursor walks the same trajectory it did on SAVE.
 8. At end of `capture_model`, `fops.stop_allocation_region()` is called so all subsequent allocations (sampler warmup, scheduler, inference workspaces) go through the standard CUDA caching allocator. The VMM region only needs to hold memory referenced by captured graphs.
 9. `compile_or_warm_up_model`'s sampler-warmup full forward is skipped via the kwarg-signature-targeted `_dummy_run` patch (returns zero hidden states for that one caller only); the compile-warmup loop is empty under our config. `_dummy_sampler_run` still runs on the zeros to populate sampler workspaces.
@@ -127,7 +127,7 @@ vLLM's lifecycle splits across the engine-core process and worker processes. Fou
 | Dense decode (Qwen3, Llama, …) | primary test target |
 | DP > 1 | multi-GPU dense |
 | MoE with DeepEP | unified path; no split-load |
-| `torch.compile` (full-graph) | runs on SAVE; `do_not_compile=True` on LOAD (faster startup; graphs replay via `CUDAGraphWrapper`) |
+| `torch.compile` (full-graph) | runs on SAVE; `do_not_compile=True` on LOAD (faster startup; graphs replay via `CUDAGraphWrapper`). LOAD's prefill then runs the uncompiled model and its outputs differ from SAVE's from the first token on; with `--compilation-config.mode 0` in every run they are identical ([measurement](save-load-workflow.md#outputs-of-load)) |
 
 ## Sibling: SGLang
 

@@ -52,14 +52,14 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 
 | item | Rec | App (serial / JSON template / binary template / member) | status |
 |---|---|---|---|
-| cluster dims, preferred cluster dims, scheduling policy, cooperative, priority, mem-sync domain and map, carveout | yes (JSON + binary) | yes on all four | handled; `PRIORITY` only effective with an instantiate flag no path uses |
-| `PROGRAMMATIC_STREAM_SERIALIZATION` (PDL; on for sm>=90 in ~200 kernel files, DeepGEMM, trtllm) | yes | serial **no** / yes / yes / member **no** (inherits template) | **gap G3** |
-| programmatic / launch-completion event edges (ports) | yes, edge data v2 | yes on serial/JSON/binary; members: deps stripped, inherit template | **gap G3** |
+| cluster dims, preferred cluster dims, scheduling policy, cooperative, priority, mem-sync domain and map, carveout | yes (JSON + binary) | yes on all four; a member that does not record one of them gets it reset to zero (before 2026-10-28 it kept the template's or the previous member's value) | handled; `PRIORITY` only effective with an instantiate flag no path uses |
+| `PROGRAMMATIC_STREAM_SERIALIZATION` (PDL; on for sm>=90 in ~200 kernel files, DeepGEMM, trtllm) | yes | serial yes (since 2026-10-28 the serial path builds with the JSON template builder) / yes / yes / member **no** (inherits template) | **gap G3** |
+| programmatic / launch-completion event edges (ports) | yes, edge data v2 | yes on serial/JSON/binary; members: deps stripped, inherit template. Since 2026-10-28 (c30c631) the topology key holds a hash of the edge list with ports and types, so a member's edges equal its template's | handled |
 | `ACCESS_POLICY_WINDOW`, `DEVICE_UPDATABLE_KERNEL_NODE` | JSON yes; binary no (clears the complete-attrs flag) | per node yes; graph-wide **no**; member **no** | **gap G3** |
-| graph-wide "common" attributes | yes (only when all nodes agree) | JSON + binary yes; **serial path ignores them** | **gap G3** |
+| graph-wide "common" attributes | yes (only when all nodes agree) | yes on every path (the serial path ignored them before 2026-10-28) | handled |
 | newer attributes (e.g. NVLink-utilisation scheduling) | not queried | rebuilt without them, silently | **gap G1** |
 | instantiate flags | no | template: auto-free-on-launch; member: 0 | matches torch; device-launch / node-priority unsupported |
-| topology key = node types + cluster dims only | — | — | **gap G2**: excludes edges, ports, function identity, PSS, APW, device-updatable; member dependencies are deleted without comparison |
+| topology key = node types + cluster dims + a hash of the edge list (ports and types; the hash since 2026-10-28, c30c631) | — | — | **gap G2** (partly closed): excludes function identity, PSS, APW, device-updatable |
 | RNG generator state, output tensors, node order | yes | yes | handled |
 
 ### 2.3 Node types
@@ -76,7 +76,7 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 | item | status |
 |---|---|
 | code images (fatbin/cubin/PTX by CRC64 + mangled name), device-linked multi-segment fatbins, cuLink at pack time | handled |
-| PTX inputs | re-JITted at LOAD by the possibly different driver; not checked |
+| PTX inputs | re-JITted at LOAD by the possibly different driver; not checked. The archive stores PTX without its terminating NUL; LOAD hands the driver a terminated copy (before 2026-10-28 the driver read past the image) |
 | `__device__`/`__constant__` globals written from the host before capture (`cudaMemcpyToSymbol`) | **not recorded, not applied**: LOAD's copy starts from the ELF initialisers; only NVSHMEM's state is handled — **gap G2b** |
 | addresses of module globals passed as kernel params; texture/surface handles | raw bytes replayed; per-process, not detected — **gap G5** |
 | GPU architecture, SM count, driver + compat version, `CUDA_MODULE_LOADING`, kernel-selecting `SGLANG_*` envs | GPU name, compute capability, SM count and memory, driver, CUDA, torch, sglang and Foundry versions, `CUDA_MODULE_LOADING` and the DeepEP dispatch size recorded per rank in `fingerprint.json` and compared at LOAD setup, which refuses a mismatch (with the server arguments that shape the graphs); other kernel-selecting `SGLANG_*` envs are not recorded — **gap G7** (partly closed); sglang bakes the SM count into grids (EP MoE, marlin, tiny_gemm, mega_moe) and topk_v2 bakes occupancy macros into its build |
@@ -87,7 +87,7 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 | item | status |
 |---|---|
 | `cuMemAlloc_v2` / pitch inside the VMM region (caching allocator, graph pool), `cuMemAddressReserve` (NVSHMEM, symm-mem) | handled: event log replayed in order, reserve = pointer advance, mismatch aborts |
-| allocation landing outside the region | `[HOOK] ERROR ... outside allocation region` **printed, not fatal** — gap G5 |
+| allocation that does not fit in the rest of the region | refused with out-of-memory and `[HOOK] ERROR: ... do not fit in the allocation region (region_size ...)`; a failed `cuMemCreate`/`cuMemMap` returns the driver error. Before 2026-10-28 both fell back to the driver's allocator, which gave the graphs a driver-chosen address LOAD could not reproduce. The default 2 GiB region that the hook gives the thread of the first `cuCtxCreate*` (a region no SAVE or LOAD sets; since 2026-10-29 only with `FOUNDRY_CTX_DEFAULT_REGION=1`) keeps that fallback |
 | pointers never in the region (pre-region memory, `cudaMallocAsync` pools, managed, pinned/zero-copy host, fabric memory of the flashinfer MNNVL dispatcher) | **no scan of kernel params** — **gap G5** |
 | device memory *contents* the graph reads but does not write (warm-up-initialised workspaces, tables, split-k semaphores, TMA descriptors in memory, trtllm multi-CTA counters) | correct only if SAVE and LOAD take identical init paths; **nothing checks it** — **gap G4** |
 | unified memory | not handled |
@@ -123,10 +123,10 @@ attention graph variants rejected; missing bs at LOAD is an error; graph-pool bo
 |---|---|---|---|---|
 | G0 | custom all-reduce (sglang default) registration on `graph_capture()` exit never replayed; symm-mem NCCL windows, NVLS, mscclpp, TBO, dsv4-trtllm: pinned off on sglang-registry-pins (pending validation); megamoe/cutedsl/K3/nixl lazy collective buffers still not bootstrapped (G0c open) | M2/M3 | any user who does not pass our recipe flags gets a silent wrong or hanging LOAD | sglang B1, B2, B5, B6, B7 |
 | G1 | function attributes: three re-applied, none recorded or compared; the next attribute kind fails like 912 or silently | M1 | every kernel library that sets attributes on its own handles | driver A1, sglang B4 |
-| G2 | member grouping ignores edges/ports/attributes; member dependencies deleted without comparison; `__device__`/`__constant__` globals written before capture are lost | M1 | silent wrong results | driver A2, A3 |
-| G3 | the three load paths disagree on graph-wide attributes, PDL and access-policy window; members never get PSS/APW/device-updatable | — | silent perf or correctness loss on PDL-heavy graphs | driver A7 |
+| G2 | member grouping ignores the attributes the member rewrite does not reapply (edges and ports are in the topology key since 2026-10-28); `__device__`/`__constant__` globals written before capture are lost | M1 | silent wrong results | driver A2, A3 |
+| G3 | members never get PSS/APW/device-updatable (the serial path builds like the JSON template path since 2026-10-28) | — | silent perf or correctness loss on PDL-heavy graphs | driver A7 |
 | G4 | read-only memory contents and in-capture lazy caches rely on identical init paths; nothing checks | M2 | silent wrong results | driver A5, sglang B3 |
-| G5 | pointers outside the region never scanned; "outside region" is not fatal; UVA host copies undetected | — | crash or silent garbage | driver A4, A9, sglang B9 |
+| G5 | pointers outside the region never scanned; UVA host copies undetected (an allocation past the region end is refused since 2026-10-28) | — | crash or silent garbage | driver A4, A9, sglang B9 |
 | G6 | external event nodes rebuilt as private events | — | silent races | driver A6 |
 | G7 | GPU/driver identity (arch, SM count, compat driver, kernel-selecting envs, baked occupancy macros) never checked at LOAD | — | wrong grids on a different GPU | driver A8, sglang B8 |
 | G8 | unsupported node types rejected with an uninformative message | — | debuggability | driver A9 |
@@ -156,9 +156,9 @@ attention graph variants rejected; missing bs at LOAD is an error; graph-pool bo
 5. **A registry of pre-capture bootstraps** run at the same sequence point on SAVE and LOAD (G0c, G0d), data-driven
    instead of the current hand-written list: add megamoe prebuild, dsv4-trtllm semaphore, nixl buffer, K3 buffers,
    the qsa workspace.
-6. **Member grouping by full topology** (G2, G3): include edges/ports and the attributes the member rewrite does not
-   reapply in the topology key, or make the rewrite reapply them; compare member dependencies with the template's
-   before stripping; make the serial path honour graph-wide attributes.
+6. **Member grouping by full topology** (G2, G3): include edges/ports (done 2026-10-28, c30c631: a hash of the
+   sorted edge list) and the attributes the member rewrite does not reapply in the topology key, or make the rewrite
+   reapply them; make the serial path honour graph-wide attributes (done 2026-10-28).
 7. **Pointer and node hygiene** (G5, G6, G8): scan 8-byte kernel-param words with `cuPointerGetAttribute` at SAVE and
    require them inside the region; make "outside allocation region" fatal in SAVE; name the node type and a
    neighbouring kernel in the unsupported-node error; record external events as such and refuse them unless the

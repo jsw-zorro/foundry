@@ -15,7 +15,8 @@ Legend for each row:
 The load paths are named explicitly, because a fact that holds on one path is often false on another:
 
 - **SER**: `CUDAGraph::load`, the serial JSON path. Exposed as `foundry.graph.CUDAGraph.load`
-  (python/foundry/graph.py:65).
+  (python/foundry/graph.py:65). Since 2026-10-28 it replays the graph's allocations and then builds with JT, so
+  the SER entries below describe the code before that date; SER now behaves as JT.
 - **JT**: `build_graph_from_parsed`, the JSON template builder (CUDAGraphParallel.cpp:266). Used when a graph has
   no `.cugraph` file or no `FLAG_COMPLETE_KERNEL_ATTRS`.
 - **BT**: `build_template_graph_binary`, the binary template builder (CUDAGraphParallel.cpp:1707).
@@ -75,14 +76,14 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
 | `CLUSTER_DIMENSION` | yes when >1 (:1344) | `KNA_CLUSTER_DIM` | yes / yes / yes / yes (MEM first resets to 1x1x1, :531-543) | In the topology key (:1664) unless `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` |
 | `PREFERRED_CLUSTER_DIMENSION` | yes (:1351) | `KNA_PREFERRED_CLUSTER_DIM` | yes / yes / yes / yes | |
 | `CLUSTER_SCHEDULING_POLICY_PREFERENCE` | yes (:1360) | yes | yes / yes / yes / yes | |
-| `COOPERATIVE` | yes (:1365) | yes | yes / yes / yes / yes (only when the member has a value; sentinel -1 keeps the template's) | **SER ignores `common_kernel_node_attrs`**. A graph where every kernel is cooperative would silently lose it on SER |
+| `COOPERATIVE` | yes (:1365) | yes | yes / yes / yes / yes (a member without a value gets 0; before 2026-10-28 the sentinel -1 kept the template's) | SER ignored `common_kernel_node_attrs` before 2026-10-28 |
 | `PRIORITY` | yes (:1368) | yes | yes / yes / yes / yes (same sentinel) | Only effective with `INSTANTIATE_FLAG_USE_NODE_PRIORITY`, which no path uses (section 4) **[doc]** |
 | `MEM_SYNC_DOMAIN`, `MEM_SYNC_DOMAIN_MAP` | yes (:1371/:1374) | yes | yes / yes / yes / yes | |
 | `PREFERRED_SHARED_MEMORY_CARVEOUT` (node) | yes (:1381) | yes | yes / yes / yes / yes | |
 | `ACCESS_POLICY_WINDOW` | yes, per node, with the raw `base_ptr` (:1387) | **no** (clears `FLAG_COMPLETE_KERNEL_ATTRS`, BinaryGraphIO.cpp:110) | yes (:2229) / per node yes (:688), **common no** / n/a (falls back to JT) / **no** | No effect without an L2 persisting set-aside, which is not recorded (section 5). The pointer is in the VMM region if the window was |
 | `DEVICE_UPDATABLE_KERNEL_NODE` | flag yes. `devNode` handle recorded in memory only, not written | `KNX_DEVICE_UPDATABLE` (ext) | yes / per node yes, **common no** / yes / **no** | The `CUgraphDeviceNode` handle the app keeps for device-side updates changes at LOAD. Not handled. Not detected |
 | `PROGRAMMATIC_STREAM_SERIALIZATION` (PDL) | yes (:1052-1062, :1405) | `KNX_PROGRAMMATIC_STREAM_SERIALIZATION` (ext) | **SER: no** (never read) / yes, per node and common (:891) / yes, per node / **no** (member inherits the template's) | The topology key does not contain it |
-| `PROGRAMMATIC_EVENT`, `LAUNCH_COMPLETION_EVENT` | captured as edge data (programmatic / launch-order ports) **[doc]** | `BinDependency` v2 ports and type | yes on SER, JT and BT (`add_graph_dependencies`). MEM: deps are **stripped** from member files (graph.py:237-249), so the template's edges are used | `core/test_graph_dependencies.py` |
+| `PROGRAMMATIC_EVENT`, `LAUNCH_COMPLETION_EVENT` | captured as edge data (programmatic / launch-order ports) **[doc]** | `BinDependency` v2 ports and type | yes on SER, JT and BT (`add_graph_dependencies`). MEM: deps are **stripped** from member files (graph.py:237-249), so the template's edges are used; since 2026-10-28 the topology key holds a hash of the edges, so they equal the member's own | `core/test_graph_dependencies.py` |
 | `IGNORE`-style / newer attributes (`NVLINK_UTIL_CENTRIC_SCHEDULING`, portable-cluster-size mode) **[unverified names/versions]** | no | no | no | Not queried at SAVE: a node carrying one would be rebuilt without it, silently |
 | Node params: grid, block, `sharedMemBytes`, `kernelParams` bytes, `extra` arg buffer | yes (:1331-1490) | yes | yes on all paths | `kernelParams` sizes come from `cuFuncGetParamInfo(params.func, …)` (:1068). **[unverified]** If a node reports only `kern` (func NULL), this returns no params and the node is saved with none. `cuKernelGetParamInfo` would be the kern-side call |
 | `CUDA_KERNEL_NODE_PARAMS.ctx` | read (:955), not written | no | LOAD uses the current context | See green contexts (section 5) |
@@ -111,7 +112,7 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
 | Instantiate flags | no | template exec: `AutoFreeOnLaunch` when the driver is >= 11.4 (CUDAGraph.cpp:479-513). Member exec: 0 (:727) | n/a | Matches torch's capture-time flags for the template. `USE_NODE_PRIORITY`, `DEVICE_LAUNCH` and `UPLOAD` are never used. A graph meant for device launch, or whose node priorities matter, would behave differently **[doc]**. No upload: the first launch pays it |
 | Common kernel attributes ("applied last") | yes: extracted only when **all** kernel nodes have identical attributes (CUDAGraph.cpp:1726-1777) | JT (:811-903) and BT (:1806-1814) apply them. **SER does not read them at all**. JT's common block skips `accessPolicyWindow` and `deviceUpdatable` | no | The binary writer sends common PSS / deviceUpdatable / APW graphs to JT (BinaryGraphIO.cpp:110-122). JT applies common PSS but drops common APW and deviceUpdatable silently |
 | Edges (ports, type; `cuGraphAddDependencies_v2`) | yes (CUDAGraph.cpp:1211-1245, :1782-1798), binary v2 | SER, JT, BT (`add_graph_dependencies`), PW (:2002-2015) | `add_graph_dependencies` fails loudly | `core/test_graph_dependencies.py` |
-| Topology key (member grouping) | node type sequence + cluster dims only (CUDAGraph.cpp:1664-1723, LOAD fallback CUDAGraphParallel.cpp:2404) | n/a | **no** | **It excludes edges and ports, function identity, PSS, APW, deviceUpdatable, and whether priority / cooperative / carveout are set.** `save_graph_manifest` strips member deps without comparing them (graph.py:237-249). MEM leaves template values for anything the member does not set (sentinel -1) |
+| Topology key (member grouping) | node type sequence + cluster dims (CUDAGraph.cpp:1664-1723, LOAD fallback CUDAGraphParallel.cpp:2404); since 2026-10-28 (c30c631) also an FNV-1a hash of the sorted edge list (from, to, ports, type) | n/a | **no** | **It excludes function identity, PSS, APW, deviceUpdatable, and whether priority / cooperative / carveout are set.** `save_graph_manifest` strips member deps (graph.py:237-249); with the edge hash in the key they equal the template's. Since 2026-10-28 MEM resets to zero any attribute the member does not record (before, it left the template's value: sentinel -1) |
 | Node order / ids | yes | yes (`ordered_nodes`) | `updates.size()==num_nodes` check (:1719) | |
 | RNG generator state (Philox seed and offset per graph) | yes (`generators`, :1800-1815) | yes (`register_generator_state`, under `SuspendAllocationRegion`, :1881-1898) | registry lookup | Torch-level, not driver, but also per-process implicit state |
 | Output tensors | yes (metadata plus raw `data_ptr`) | `from_blob` at the recorded address | through the VMM address checks | |
@@ -120,7 +121,7 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
 
 | Item | Rec | App | Det | Notes |
 |---|---|---|---|---|
-| Code image the node needs (fatbin / cubin / PTX, by CRC64 hash + mangled name) | yes: hooks on `cuModuleLoadData(Ex)`, `cuModuleLoadFatBinary`, `cuModuleLoad`, `cuLibraryLoadData`, `cuLibraryLoadFromFile` (hook.cpp:2015-2250). JIT options and library options are recorded (hook.cpp:580-740; log-buffer options ignored :640) | loaded by `load_cuda_modules_and_libraries` (hook.cpp:4544) with the same options | SAVE: a node whose module came through an unhooked entry point aborts in `query_binary_hash` ("handle not found", hook.cpp:4410). LOAD: missing hash or name aborts (:4371-4405). Function-count mismatch aborts (:1570) | JIT-produced cubins (Triton, DeepGEMM, nvrtc, flashinfer, inductor) are covered because they arrive through `cuModuleLoadData`/`cuLibraryLoad*` |
+| Code image the node needs (fatbin / cubin / PTX, by CRC64 hash + mangled name) | yes: hooks on `cuModuleLoadData(Ex)`, `cuModuleLoadFatBinary`, `cuModuleLoad`, `cuLibraryLoadData`, `cuLibraryLoadFromFile` (hook.cpp:2015-2250). JIT options and library options are recorded (hook.cpp:580-740; log-buffer options ignored :640) | loaded by `load_cuda_modules_and_libraries` (hook.cpp:4544) with the same options | SAVE: a node whose module came through an unhooked entry point aborts in `query_binary_hash` ("handle not found", hook.cpp:4410). LOAD: missing hash or name aborts (:4371-4405). Function-count mismatch aborts (:1570) | JIT-produced cubins (Triton, DeepGEMM, nvrtc, flashinfer, inductor) are covered because they arrive through `cuModuleLoadData`/`cuLibraryLoad*`. File-loaded images (`cuModuleLoad`, `cuLibraryLoadFromFile`) are written for the driver to a file of the LOAD process's own under `$TMPDIR` (default `/tmp`); before 2026-10-28 the file had a fixed name inside the archive, which a read-only or shared archive could not hold |
 | Multi-segment device-linked fatbins (`FATBINC_LINK_VERSION`, rdc, NVSHMEM) | segments recorded | `cuLink*` at pack time (`prelink_fatbin_segments`, hook.cpp:1700) or at LOAD (:4877) | a link failure is a warning with fallback (:1731-1757) | The link result depends on the driver's JIT linker, so a compat-driver change can change it |
 | PTX inputs | stored as PTX | re-JITted at LOAD | no | Different driver means possibly different SASS, and a JIT cost at LOAD |
 | GPU arch / SM count / driver version / compat driver / `CUDA_MODULE_LOADING` | sglang integration: `fingerprint.json` per rank (`archive_fingerprint`: name, compute capability, SM count, memory, NVML driver version, CUDA version, `CUDA_MODULE_LOADING`); vllm integration: `warmup_state.json` stores `gpu_name` and `cuda_version` (runtime.py:74-80) | sglang: compared at LOAD setup, a mismatch refuses the archive; vllm: **never compared at LOAD** | only indirectly (no SASS: module load fails; cluster occupancy differs: 912, etc.) | A different driver can pick different SASS or PTX-JIT output. A different SM count changes occupancy-derived grids that are baked into params |
@@ -142,7 +143,7 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
 |---|---|---|---|---|
 | `cuMemAlloc_v2` / `cuMemAllocPitch_v2` inside the VMM region (torch caching-allocator segments and graph pool included) | alloc/free event log per graph (`allocator_events`), plus `start_base_addr` | replayed in order (hook.cpp:4251-4345) | LOAD: `Memory offset mismatch` abort (:4260) and `Allocation address mismatch` abort (:4296) | `core/test_allocation_region.py`, `core/test_save_load.py` |
 | `cuMemAddressReserve` (expandable segments, symm-mem, NVSHMEM) | reserve events | pointer advance | mismatch abort | |
-| Allocation that lands outside the region | — | — | `[HOOK] ERROR: Allocated address … is outside allocation region` (hook.cpp:2589 / :2769). **Printed only, not fatal** | |
+| Allocation that does not fit in the rest of the region | — | — | refused with out-of-memory (`[HOOK] ERROR: ... do not fit in the allocation region`); before 2026-10-28 it fell back to the driver's allocator and only a failed map was printed. The default region of the first `cuCtxCreate*` thread (since 2026-10-29 only with `FOUNDRY_CTX_DEFAULT_REGION=1`) keeps the fallback | `core/test_allocation_region.py::test_allocation_past_the_region_end_fails`, `::test_context_default_region_falls_back_to_the_driver` |
 | Pointers in kernel params / memcpy / memset that were **never** in the region: memory from before `set_allocation_region`, `cuMemAllocAsync` / `cudaMallocAsync` pools, `cuMemAllocManaged`, `cuMemHostAlloc` / pinned or zero-copy host memory, driver-internal allocations | raw bytes | replayed raw | **no** | None of these entry points is hooked. There is no SAVE-time scan of param words. LOAD works only if the same object happens to sit at the same address |
 | Device memory **contents** the graph reads but does not produce (weights, warm-up-initialised workspaces, lookup tables, split-k semaphores, TMA descriptors stored in memory) | no | no | no | Correct only if 2nd SAVE and LOAD run identical init (CLAUDE.md rule). Nothing checks it |
 | Host-pinned buffers used by memcpy nodes | rejected when reported as host (section 3) | — | partly | |
@@ -161,11 +162,11 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
    list the `STT_OBJECT` symbols of each used binary from the ELF symbol table, read them at capture end with
    `cuModuleGetGlobal`/`cuLibraryGetGlobal` and D2H, and store any that differ from the image's initialiser. At
    LOAD, write them into the archive copy. Alternatively, hook `cuModuleGetGlobal` + `cuMemcpyHtoD*` to flag writes.
-3. **The topology key ignores edges, ports and the attributes MEM does not rewrite.** Those attributes are PSS,
-   APW, deviceUpdatable, and whether priority / cooperative / carveout are set. Member deps are stripped unchecked
-   (graph.py:237-249), so a member can run with the template's ordering, silently. How to detect at SAVE: add a hash
-   of (deps + ports + types) and of those attributes to `topology_key`, or compare member deps to the template's in
-   `save_graph_manifest` before stripping.
+3. **The topology key ignores the attributes MEM does not rewrite.** Those attributes are PSS, APW and
+   deviceUpdatable. Edges and ports: since 2026-10-28 (c30c631) the key holds a hash of (deps + ports + types), so
+   graphs whose edges differ get separate templates; before, member deps were stripped unchecked (graph.py:237-249)
+   and a member could run with the template's ordering, silently. Remaining detection at SAVE: add a hash of those
+   attributes to `topology_key`.
 4. **Pointers outside the VMM region.** The sources are async pools, managed memory, pinned or zero-copy host
    memory, pre-region allocations and symbol addresses. The out-of-region message is non-fatal, and nothing scans
    params. How to detect at SAVE: scan 8-byte-aligned words of each node's params, memcpy and memset addresses. For
@@ -179,8 +180,8 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
    and a wait becomes a no-op race. Event flags are lost too. How to detect at SAVE: fail, or at least warn, on any
    event node whose partner is not in the same graph. Better, record the event's creator or site.
 7. **Path divergence.**
-   - SER (`CUDAGraph.load`, graph.py:65) ignores `common_kernel_node_attrs` and PSS completely. A graph whose
-     kernels are all cooperative or all PDL loses those attributes.
+   - SER (`CUDAGraph.load`, graph.py:65) ignored `common_kernel_node_attrs` and PSS completely; since
+     2026-10-28 it builds with JT.
    - JT drops *common* APW and deviceUpdatable.
    - MEM never applies PSS, APW or deviceUpdatable.
    - Non-portable common cluster dims get no opt-in.

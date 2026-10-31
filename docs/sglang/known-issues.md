@@ -1,15 +1,103 @@
 # Known issues — SGLang integration
 
-## Exec share mode: tokens differ from native on one tested model (OPEN, 2026-10-28)
+## Exec share mode: tokens differ from native on one tested model (cause OPEN, 2026-10-28)
 
-With `FOUNDRY_ENABLE_EXEC_SHARE=1` on LOAD, `tests/sgl/e2e/test_save_load_multigpu.py` fails for Qwen3.5-35B-A3B TP2
-(real weights, upstream main `2c83dc6656`, 2xH200): 302 of the 2088 compared outputs differ from native, in 50 of the
-64 decode batch sizes, by up to 6.3 in logprob. Most differences start at the first output token, which the eager
-prefill computes, so a replay of a switched member wrote memory that a later prefill reads; one replay computing a
-wrong value would not do that. The default eager mode passes the same case, and share mode passes the Qwen3.5-35B-A3B
-EP2 (DP attention) case and the 1-GPU test. Cause not determined. Serve with the default eager mode until this is
-fixed; LOAD logs a warning when share mode is enabled. The earlier share-mode runs compared only batch-size-1 outputs,
-which no member graph produces.
+With `FOUNDRY_ENABLE_EXEC_SHARE=1` on LOAD, `tests/sgl/e2e/test_save_load_multigpu.py` failed for Qwen3.5-35B-A3B TP2
+(real weights, upstream main `2c83dc6656`, 2xH200): 302 of the 2088 compared outputs differed from native, in 50 of
+the 64 decode batch sizes, by up to 6.3 in logprob. In each failing batch of size b replayed on the exec of a template
+of size T, the outputs of requests 0 to T-b-1 differ. The default eager mode passes the same case, and share mode
+passed the Qwen3.5-35B-A3B EP2 (DP attention) case and the 1-GPU test.
+
+Measured on the same archive (one LOAD per variant, outputs compared with native):
+
+| Share-mode variant | Templates | Probes that differ |
+|---|---|---|
+| saved groups refined by binary, DAG, cluster dims, cooperative | 22 | 50 |
+| members' kernel parameters set again on the exec after the update (all kernels, clustered kernels, or memcpy/memset nodes) | 22 | 50 |
+| members split by memcpy extents | 64 | 0 |
+| members split by the launch dims of clustered kernels | 64 | 0 |
+| members split by every kernel's launch dims | 64 | 0 |
+
+The graphs hold 817 kernel nodes (664 on programmatic edges; clustered allreduce-fusion and cuBLAS kernels), 40
+device-to-device memcpy nodes and one memset. A memcpy node, a clustered kernel and a PDL producer/consumer pair each
+switch correctly in isolation, with members smaller than their template (`core/test_exec_share.py`). The cause is
+not determined. Since 2026-10-28 share mode gives members whose memcpy or memset extents or clustered launch dims
+differ from their template their own template, so on this model every graph has its own exec and LOAD matches native;
+graphs whose members differ only in kernel arguments and in the launch dims of unclustered kernels are still
+switched. Serve with the default eager mode; LOAD logs a warning when share mode is enabled.
+
+## Code audit of 2026-10-28 (FIXED)
+
+A review of the hook, the graph save and restore code, the binary format and both integrations, with every finding
+checked against the code by a second reviewer, found the defects below; a review of the fixes (2026-10-29) added
+the follow-ups in the same rows. Each is fixed on branch
+sglang-upstream-compat; the test that covers it is named where one exists.
+
+| Area | Defect | Effect before the fix | Fix | Test |
+|---|---|---|---|---|
+| Allocation region | An allocation that did not fit in the rest of the region (64 GiB default) went to the driver's allocator | SAVE finished; the graphs pointed at memory LOAD did not have (crash or wrong tokens) | Refused with out-of-memory and the region size named; default `region_size` 256 GiB | `core/test_allocation_region.py` exhaustion |
+| Allocation region | A failed reservation at `base_addr` only printed `[HOOK] ERROR` | The engine ran without the region; the LOAD error named another cause | `set_allocation_region` raises; the schedulers reserve before restoring modules (early reserve) | `core/test_allocation_region.py` reserve failure |
+| Allocation region | A large reservation (NVSHMEM heap) placed away from its hint was accepted | DeepEP graphs addressed SAVE's heap | Refused (`FOUNDRY_ALLOW_RELOCATED_RESERVE=1` accepts it) | - |
+| Allocation region | `free_preallocated_region` unmapped memory still in use; a second identical `set_allocation_region` moved the cursor back | Use of unmapped memory; two tensors at one address | The span stays mapped while in use (and serves no region set later below it); the cursor is kept | `core/test_allocation_region.py` free live span, kept span |
+| Binary archive | `.cugraph` counts and offsets were not checked against the file | A truncated file crashed LOAD (heap over-read) | Checked; a damaged binary is skipped and the graph read from its JSON | `core/test_archive_damage.py` |
+| Archive writes | Graph JSON, `.cugraph` and the packed images were written in place and their write errors ignored | A full disk left a truncated archive that SAVE reported as complete | Written to a temporary name and renamed; a failed write raises; a `.cugraph` of an earlier SAVE is removed before the new JSON is written | - |
+| Templates | `save_graph_manifest` also matched `graph_manifest.json`; LOAD did not check the manifest's roles (a graph in two groups or in none, a member whose template is not in the same call); the exec-pool prewarm looked dependency node ids up with `.at` | A second manifest write raised `ValueError`; a graph in no group was never built (replay error at first use); the prewarm stopped at a dependency on an unknown node id (logged; LOAD went on without it) | Files matched as `graph_<index>_*.json`; roles checked at LOAD with the graph named; the prewarm skips a graph it cannot build | `unit/test_archive_files.py`, `core/test_archive_damage.py` |
+| Templates | A member did not reset kernel-node attributes it does not record (cooperative, mem-sync domain, preferred cluster, ...) | It launched with the template's attributes | Unrecorded attributes reset to zero on each rewrite | `core/test_template_attrs.py` |
+| RNG | Restored Philox kernels read SAVE's seed/offset tensors, LOAD filled its own (archive format v3 records the addresses) | Graphs with RNG replayed the same random numbers | LOAD points the tensors at SAVE's addresses when restored memory holds them, otherwise stops. torch < 2.13 keeps one pair per generator, allocated before the recording: there LOAD stops for a graph with RNG whose pair is elsewhere | `core/test_save_load.py` rng_segment (torch >= 2.13) |
+| Serial load | `CUDAGraph.load` ignored common kernel attributes and PSS and accepted raw pointers in `extra` | Lost attributes; host memory read | Builds with the JSON template builder; `extra` decoded strictly; parameter count and sizes checked against the loaded function | `core/test_save_load.py` |
+| Modules | PTX archived without its NUL; file-loaded images restored through a fixed-name file in the archive; packed-image sizes checked with wrapping arithmetic; module loads of device-link segments passed a null image; an image LOAD read into memory (`FOUNDRY_MMAP_ARCHIVE=0`) or linked was freed after a `cuLibraryLoadData` with `CU_LIBRARY_BINARY_IS_PRESERVED`, which lets the driver read it until unload | Driver over-read; races between LOADs; endless parse loop on a corrupt size; abort; driver reads of freed memory | NUL-terminated copy; per-process file under `$TMPDIR`; checks by subtraction; segments linked at LOAD; such images kept for the process lifetime, linked images loaded without the option | `core/test_ptx_module.py` |
+| VMM IPC | The socket name held only the pid | Two hooked processes with one pid in a shared network namespace: exports failed | Name holds the process's random token | - |
+| SGLang | Decode graphs archived only the logits | No decode hidden states with a return-hidden-states mode on LOAD | Every tensor field archived (`decode_graphs.json`) | `sgl/test_runtime_contracts.py` |
+| SGLang | The plugin entry point imported foundry outside activate()'s guard | An import failure served without Foundry | Exits the process | `sgl/test_runtime_contracts.py` |
+| SGLang | The fingerprint did not record `base_addr` and `region_size` | LOAD with another `region_size` placed the NVSHMEM heap (DeepEP) elsewhere than the graphs address it | Recorded; a fingerprint without a field the code records (an older Foundry's) is refused with "re-SAVE" | `sgl/test_runtime_contracts.py` |
+| SGLang | Fingerprint checked after the archived modules loaded; environment pins accepted spellings sglang reads differently; `graph_templates = "false"` read as true; embedding models produced empty archives | Abort instead of the refusal; pins not in effect; templates kept; LOAD abort | Checked first; pins rewritten canonically; TOML booleans only; embedding models refused (`--is-embedding` on both routes; a reward or classification model that sglang detects by its architecture on the plugin route only: on the dependency route its SAVE writes no graphs and LOAD stops at the missing `region_layout.json`) | `sgl/test_pins.py`, `sgl/test_runtime_contracts.py` |
+| vLLM | No fingerprint, layout record, scratch boundary record, capture-order check or configuration refusals | LOAD under other settings restored graphs at wrong offsets | Ported from the SGLang integration (see [`../vllm/save-load-workflow.md`](../vllm/save-load-workflow.md)) | - |
+| Exec share | Members with other cluster dims or cooperative launches shared a template exec | LOAD abort or a rejected update | Such members get their own template | - |
+| Exec share | See the entry above (cause open) | Wrong tokens on a TP2 model | Members with other copy extents or clustered launch dims get their own template | `core/test_exec_share.py` |
+
+## Failure-mode audit of 2026-10-29 (FIXED unless marked)
+
+A second review looked at what an engine does after startup, threads and lifetimes, failure paths, multi-rank
+consistency and the latest upstream main (`f2d3188`); each finding was checked against the code by a second
+reviewer. The configurations of the first three rows were not in the validated set; the e2e cases named in the last
+column reproduce them. A third review (the rows from "Host memory" on) covered the entry points, serving features,
+child processes of the launcher and the small modules; none of its findings occurred in a validated configuration.
+
+| Area | Defect | Effect before the fix | Fix | Test |
+|---|---|---|---|---|
+| Lazy model state | SAVE captured each shape without an eager forward, so what a model builds on its first forward went into the first captured graph only: the RoPE cos/sin cache converted to the activation dtype (mrope: Qwen2.5-VL, Qwen3-VL; the fallback rotary kernel for head sizes outside 64/128/256/512, e.g. Phi-3 at 96) and the local expert map of EP without an all-to-all backend | Restored graphs and eager code read a table only the first graph writes, from a source buffer LOAD frees: wrong tokens or an illegal address | One warm-up forward at each capture scope's first shape on SAVE and LOAD (`capture_loop_version` 3); its transient memory is released on both modes | e2e `phi3_rope96`, `q25vl_mrope`, `q35_tp2ep2_std` (each fails without the fix: SAVE tokens differ from native, or an illegal address at the largest batch) |
+| Weight loading | sglang's DeepSeek-family loaders copy CPU weights on a thread pool; those threads allocate outside the thread-local region, and post-load processing can place persistent tensors in their cached segments | Weights at driver-chosen addresses that differ on LOAD (W4A16 / AWQ / GPTQ MoE layouts) | `should_async_load` returns False from the end of distributed init to the layout start on SAVE and LOAD (both routes); live tensors outside the region at the layout start stop both modes | `sgl/test_runtime_contracts.py` |
+| Collectives | The pre-capture bootstrap connected only the torch.distributed communicators; the captured collectives run on each group's PyNccl communicator, connected per algorithm at first use (inside SAVE's capture, never on LOAD); the DCP and shared-experts TP groups were left out | Hang or fault at the first restored collective of an algorithm the init all-reduce did not connect (TP across nodes, DCP all-to-all) | PyNccl communicators get the same small and large collectives; point-to-point peers connect in the warm-up forward | - |
+| Distributed init | Allocations below the scratch boundary (communicators, symmetric-memory buffers, multicast mapping) were not compared | Another NCCL build or setting, cuBLAS workspace or multicast support moved them while every check passed: hang, fault or wrong reductions | Offset trail from `after_setup_graph_ext`; the allocations and carved reservations live below the weights compared at the scratch skip | `sgl/test_runtime_contracts.py` |
+| Archive records | Archives without `fingerprint.json`, the scratch boundary or the offset trail (older releases) loaded with those checks off; a LOAD cursor behind the layout start was moved up | Silent loads of archives the current checks would refuse | `capture_loop_version` 3 required; each record required; any cursor difference at the layout start stops LOAD | `sgl/test_runtime_contracts.py`, `unit/test_sglang_runtime_state.py` |
+| Fingerprint | Raw (unresolved) server arguments; no deterministic-inference, all-reduce-fusion, DCP, linear-attention, mamba or DSA backend fields; no NCCL, FlashInfer, sgl-kernel, DeepEP, DeepGEMM, NVSHMEM or Triton versions; no NCCL / symmetric-memory / allocator variables; no sglang commit for a git checkout; no rank; model path compared as a path | LOAD under another build or setting passed; one model named two ways was refused | Resolved values, the fields, `package <name>` versions, `nccl version` and the library PyNccl loads, the device-allocator settings, the variables, `sglang source`, `rank` and the model as a digest of its config-class view (AutoConfig, without `transformers_version` and `_name_or_path`; else of config.json, hub ids through the hub cache); a value one side cannot determine (`unknown (...)`) is logged and not compared | `sgl/test_runtime_contracts.py` |
+| Archive identity | Nothing tied the files of a rank directory to one SAVE run | Two engines writing one `workspace_root` gave an archive mixing both | A SAVE id in `fingerprint.json` and `region_layout.json`, compared at LOAD | `sgl/test_runtime_contracts.py` |
+| Checkpoints | SAVE and LOAD logged different labels around the capture scopes; the per-graph replay moved a lagging cursor up silently | A smaller decode-runner allocation on LOAD went unnoticed | `prefill_scope_end`, `decode_scope_start`, `decode_scope_end` on both modes; each realignment logged with its size | - |
+| Setup | No check that the hook is preloaded (a wrong `hook_library_path`, Ray actors) or that torch's allocator is the one the hook sees | Archives without graph memory; failures far from the cause | The scheduler checks that `cuMemAlloc_v2` resolves to the hook; expandable segments and `cudaMallocAsync` refused; a missing `hook_library_path` refused; `--use-ray` refused | `sgl/test_pins.py`, `sgl/test_runtime_contracts.py` |
+| NVSHMEM | A restored module whose NVSHMEM init failed or could not run was only logged | DeepEP kernels on unset device state at the first replay | LOAD stops with the modules named | - |
+| Exit paths | A failed SAVE packed the images into `./hook_archive` at exit; a thread pool whose thread creation failed called `std::terminate`; a Phase 2 job could write locals already destroyed; a failed prewarm thread creation failed LOAD | Multi-GB writes and aborts after the real error | Pack-on-exit disarmed after each graph save; pools join their started workers and rethrow; locals declared before the worker; prewarm optional | - |
+| Dependency route | The warm-up forward needs the attention backend's reset, which the adapter passes only from integration API 2.1 | - | An older adapter runs without the warm-up (warning); API 2.1 adds `post_warmup_hook` to `capture_one` | `sgl/test_runtime_contracts.py` |
+| LOAD memory | Memory LOAD mapped on demand inside the preallocated span (allocations SAVE did not keep live, the warm-up forward's among them) stayed mapped after it was freed | LOAD held more memory than SAVE after startup | The hook releases such a segment once no allocation uses it | - |
+| Recapture (OPEN, documented) | After `update_weights_from_disk(recapture_cuda_graph=true)` on LOAD, the restored graphs' memory stays mapped while the recaptured graphs take new memory | The recapture needs one more decode-graph footprint of free memory than on a SAVE engine | - | - |
+| Exit (OPEN) | The detached exec-pool prewarm and Phase 2 threads keep running when a LOAD fails during startup | The process can abort while exiting, after the error is logged | - | - |
+| Per-shape lazy state (OPEN) | State a model creates lazily for one batch size, other than the first captured one, is still created inside that shape's capture | Not observed in the validated configurations | - | - |
+| Host memory | HiSparse's host KV pool, DeepSeek-V4.1 Engram tables in host memory (the resolved `--engram-config`; on an sglang without it, `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE` for a model with Engram layers and no peer shards, both variables as that sglang parses them), the PLE embedding offload (on by default for BF16 Qwen4-Exp on CUDA), `--cpu-offload-gb` and `--offload-group-size` were accepted (the last two refused only at the first graph save) | Restored graphs read the pinned host addresses of the SAVE process | Refused at resolution | `sgl/test_pins.py` |
+| Weight cache | `--weight-cache-mode daemon` / `client` was accepted; the parameters are CUDA IPC mappings of the daemon's memory at addresses the driver picks per process | Restored graphs read SAVE's parameter addresses | Refused at resolution; at the layout start every model parameter and buffer must lie in the region, or in a reservation of 2 GiB or more that the hook placed at its fixed address after the region (DeepSeek-V4.1 Engram peer shards) | `sgl/test_pins.py`, `sgl/test_runtime_contracts.py` |
+| torch.compile | `--enable-torch-compile` was accepted while Foundry pins `TORCHDYNAMO_DISABLE=1` | The compiled batch sizes captured sglang's uncompiled reference ops | Refused | `sgl/test_pins.py` |
+| PD disaggregation | Mooncake's intra-node NVLink transport exports the KV pool (region memory) through CUDA IPC handles that a process without the hook cannot open | Every KV transfer into a Foundry engine fails | Refused with `MC_INTRANODE_NVLINK=1` or `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK` | `sgl/test_pins.py` |
+| Fingerprint | `disable_radix_cache`, `mamba_radix_cache_strategy`, `mamba_track_interval`, `disable_overlap_schedule`, `weight_cache_mode` and `enable_torch_compile` were not recorded | A LOAD of a hybrid model under another radix-cache setting passed | Recorded | `sgl/test_runtime_contracts.py` |
+| Launcher | A record resolved in a process that had not loaded the plugin (sglang's `HttpServerEngineAdapter`, `http_server.launch_server` in a child) reached the schedulers without Foundry's pins and refusals; a second engine in one process kept the first config's mode and preload environment | SAVE with custom all-reduce enabled, then an illegal address at the first LOAD replay; a SAVE engine after a LOAD engine aborted at its first graph save | The spawn site refuses a record without Foundry's resolution declaration, and a config variable that differs from the one the process activated with | `sgl/test_plugin_route.py` |
+| Preloads | A library the launcher already preloaded (the documented shell export of the udev-wait shim) stayed after the hook, and the hook's `dlsym` called the real `dlsym` itself, so glibc resolved `RTLD_NEXT` and `RTLD_DEFAULT` from the hook's position | A preloaded wrapper after the hook got its own function back from `dlsym(RTLD_NEXT, ...)` and called itself; no failing run known | Foundry's libraries go first; on x86-64 `dlsym` is an assembly entry point that jumps into the real `dlsym` with the caller's return address, so every lookup the hook does not intercept resolves as without the hook (other architectures keep the C++ forwarding with its two corrections) | `sgl/test_runtime_contracts.py`, `core/test_hook_dlsym.py` |
+| Default region | The first `cuCtxCreate*` of a hooked process gave its thread a 2 GiB region at `0x500000000000`, replacing a region the thread already had | In children of a Foundry launcher, a thread with its own context (`NCCL_CREATE_THREAD_CONTEXT=1`, CuTe DSL `initialize_cuda_context`) got memory mapped for its device only; no caller in sglang | Only with `FOUNDRY_CTX_DEFAULT_REGION=1`; never replaces a region | `core/test_allocation_region.py` |
+| Archive check | Torch symmetric-memory and multicast pointers (reservations below the layout start) were reported as memory LOAD would not have | False reports of `archive_check` | `region_layout.json` records the reservations; they are covered | - |
+| FlashInfer CuTe cache | The cache patch also replaced FlashInfer's SM12x PTX check, and a cache miss under `FLASHINFER_DISABLE_JIT` failed the GDN prefill | Kernel errors off SM90; a prefill failure native sglang does not have | Installed on SM90 only; a cache miss compiles | `unit/test_sglang_flashinfer_cute_cache.py` |
+| Preflight | A bare-name `hook_library_path` failed preflight; the LOAD check read one rank and passed archives that LOAD refuses (no layout or fingerprint, another capture-loop version, mixed SAVE ids) | Preflight results that differ from the engine's | A bare name is resolved by ld.so's list mode for the interpreter the schedulers run; every rank directory checked | `sgl/test_preflight.py` |
+
+## Archives from before capture_loop_version 3 (RULE, 2026-10-29)
+
+`capture_loop_version` 3 adds the warm-up forward at each capture scope's first shape, on SAVE and LOAD, which
+changes the allocation layout. LOAD refuses version 2 archives at setup: `Foundry archive ... has
+capture_loop_version=2, this code needs 3: re-SAVE with the current code`.
 
 ## Archives from before capture_loop_version 2 (RULE, 2026-09-30)
 

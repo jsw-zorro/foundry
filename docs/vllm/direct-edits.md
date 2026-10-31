@@ -109,7 +109,7 @@ def _support_torch_compile(...):
     ...
 ```
 
-On LOAD, the wrapped class never gets the `_support_torch_compile.__call__` machinery installed (early return). Dispatch goes through `gpu_model_runner.py:4884`'s `CUDAGraphWrapper(self.model, ...)` reassignment instead — `self.model(...)` from `_dummy_run` calls the wrapper, which on LOAD goes straight to `finish_one_graph_load(...)` for replay. The inner runnable is never invoked, so skipping torch.compile setup is safe and saves the ~2-4s Dynamo + AOT-cache-load cost on cold start.
+On LOAD, the wrapped class never gets the `_support_torch_compile.__call__` machinery installed (early return). Dispatch goes through `gpu_model_runner.py:4884`'s `CUDAGraphWrapper(self.model, ...)` reassignment instead — `self.model(...)` from `_dummy_run` calls the wrapper, which on LOAD goes straight to `finish_one_graph_load(...)` for replay. The inner runnable is never invoked for a captured batch, so skipping torch.compile setup saves the ~2-4s Dynamo + AOT-cache-load cost on cold start. The prefill and every batch without a graph do invoke it: on LOAD they run the uncompiled model, whose numerics differ from SAVE's compiled model, so LOAD's outputs differ from SAVE's and native from the first token on (measured in [`save-load-workflow.md`](save-load-workflow.md#outputs-of-load)).
 
 ## 6. `vllm/utils/flashinfer.py` (~8 lines, small adjustment)
 

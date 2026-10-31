@@ -97,7 +97,7 @@ allocates the NVLink buffer via `cudaMalloc` + `cudaIpcGetMemHandle` on **both**
 SAVE and LOAD. The hook then:
 
 - **SAVE**: exports each VMM-backed NVL buffer as a POSIX fd, served to peers
-  over `\0foundry-vmm-ipc.<pid>` via `SCM_RIGHTS` (same-uid `SO_PEERCRED` check,
+  over `\0foundry-vmm-ipc.<pid>.<token>` via `SCM_RIGHTS` (same-uid `SO_PEERCRED` check,
   per-process token vs PID reuse).
 - **LOAD**: buffers are carved from the preallocated chunk (no individual
   handle), so the hook exports the **whole chunk** fd + offset; the peer maps the

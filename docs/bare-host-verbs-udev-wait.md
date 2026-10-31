@@ -94,9 +94,10 @@ export LD_PRELOAD=/path/to/libno_cdev_wait.so${LD_PRELOAD:+:$LD_PRELOAD}
 ```
 
 Foundry itself adds `libcuda_hook.so` from Python (`integration/sglang/runtime.py`,
-`setup_ld_preload_env`) by prepending to whatever `LD_PRELOAD` already holds, so an exported shim
-survives into the SAVE and LOAD engines; the recipe scripts and the `experimental/matrix3` harness set
-nothing else. A launcher that overwrites the variable drops one of the two libraries, and the SAVE/LOAD
+`setup_ld_preload_env`): its libraries go first (the shim named in the TOML, the NVSHMEM host library,
+the hook), then the entries `LD_PRELOAD` already holds, without the copies of Foundry's, so an exported
+shim survives into the SAVE and LOAD engines and stays before the hook; the recipe scripts and the
+`experimental/matrix3` harness set nothing else. A launcher that overwrites the variable drops one of the two libraries, and the SAVE/LOAD
 engines then silently lose the shim while the native engines keep it, which makes their start times
 incomparable.
 

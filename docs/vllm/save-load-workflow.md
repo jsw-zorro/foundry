@@ -118,6 +118,32 @@ LOAD (success):
 INFO:     Application startup complete.
 ```
 
+## Checks at worker start
+
+Every worker refuses, before the allocation region is set up, the configurations whose graphs Foundry cannot save
+or restore: a `cudagraph_mode` with piecewise graphs (only `FULL_DECODE_ONLY` and `FULL`), the V2 model runner,
+pipeline parallelism, elastic EP, LoRA and speculative decoding. Custom all-reduce is turned off
+(`disable_custom_all_reduce=True`, logged as a pin): its kernels read peer buffers registered per captured graph,
+which LOAD does not register. `install_hooks` sets `VLLM_USE_V2_MODEL_RUNNER=0`, `NCCL_GRAPH_REGISTER=0` and
+`NCCL_LOCAL_REGISTER=0` when unset and refuses a contrary value.
+
+Each rank's SAVE writes two records next to its graphs:
+
+- `fingerprint.json`: the settings that shape the graphs or size the buffers they address (model, as the
+  digest of its `config.json` for a local directory, dtype,
+  quantization, `max_model_len`, `max_num_seqs`, `max_num_batched_tokens`, block size, KV dtype, parallel sizes,
+  all-to-all backend, `cudagraph_mode` and capture sizes, the region's base, size and scratch), the vLLM, Foundry,
+  torch, CUDA and driver versions and the GPU. LOAD compares it before the archived modules load and stops with the
+  differences named, and stops as well when the file is missing or lacks a field the current code records (an
+  archive of an older Foundry: re-SAVE); `FOUNDRY_VLLM_SKIP_FINGERPRINT=1` skips the comparison.
+- `region_layout.json`: the scratch boundary weight loading starts at (scratch_space_size, or the cursor when
+  distributed init allocated past it) and the allocation offset at `after_scratch_skip`, `before_load_model`,
+  `after_load_model`, `before_capture_model` and `after_capture_model`. LOAD moves to SAVE's boundary (and stops
+  when its own distributed init went past it) and stops at the first checkpoint whose offset differs.
+
+At LOAD the capture loop must ask for the archived graphs in SAVE's order, and every archived graph must be
+restored by the end of `capture_model`. A KV block count that differs from `warmup_state.json` stops the engine.
+
 ## Validation
 
 A correct LOAD:
@@ -125,11 +151,32 @@ A correct LOAD:
 1. `final_alloc_offset` from SAVE pass 2 matches the LOAD-side post-replay cursor (foundry validates this internally).
 2. `query.sh` returns coherent text. If cursors match but output is garbage, see [`memory-consistency.md`](memory-consistency.md).
 
+### Outputs of LOAD
+
+Measured 2026-10-29 with the vLLM fork at `eed7819a2` (Qwen3-1.7B, 1xH200, `FULL_DECODE_ONLY`; one native
+run, SAVE passes 1 and 2 and one LOAD, each answering the same 12 greedy requests of 24 and 32 tokens with
+logprobs):
+
+| Compilation in every run | LOAD vs SAVE pass 2 | SAVE pass 2 vs native |
+|---|---|---|
+| off (`--compilation-config.mode 0`) | texts and logprobs identical | texts identical; logprobs differ by at most 3e-6 |
+| default (torch.compile) | 2 of 12 texts differ; first-token logprobs differ by up to 0.078 | texts identical; logprobs differ by at most 3e-6 |
+
+With torch.compile, LOAD does not compile the model (`do_not_compile`, see [`direct-edits.md`](direct-edits.md)):
+the decode graphs replay SAVE's compiled kernels, but the prefill runs the uncompiled model, so the outputs differ
+from the first token on. LOAD's first-token logprobs also differ from those of a native run without
+torch.compile, by up to 0.062 with vLLM's custom ops and up to 0.051 with `custom_ops=["none"]`; which
+uncompiled configuration LOAD's prefill equals is not determined. With compilation off in every run, LOAD
+reproduces SAVE exactly. The difference between SAVE and native occurs in both settings, from the prefill on;
+its cause is not determined.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
 | `[HOOK] ERROR: Memory offset mismatch during replay` | An asymmetric allocation between SAVE pass 2 and LOAD. The watermark logs identify which lifecycle phase. |
+| `Foundry LOAD: allocation offset at <checkpoint> is ..., SAVE had ...` | LOAD allocated differently from SAVE pass 2 before that checkpoint (other settings, model or software). Serve with SAVE's settings or re-SAVE (both passes). |
+| `Foundry LOAD: archive ... was saved under other settings (...)` | The fingerprint differs; the message lists each field with both values. |
 | LOAD aborts at first inference with `Called CUDAGraph::replay without a preceding successful capture or load` | On-demand graph lost its template link. Should not happen — `start_graph_builds` loads all paths in a single C++ call; if it does, check `_patch_capture_model` and that `_pending_graph_builds.identifier_to_index` covers every BatchDescriptor visited by the capture loop. |
 | `_initialize_kv_caches` complains about missing fields on LOAD | `warmup_state.json` not written by SAVE pass 1. Re-run pass 1, then pass 2. |
 | Hangs in NCCL bring-up | `setup_graph_extension` may have set up the VMM region after NCCL already touched memory. Verify `_patch_init_worker_distributed_environment` is wrapping the correct upstream symbol (vLLM renames sometimes). |

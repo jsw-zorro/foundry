@@ -158,16 +158,16 @@ SAVE:
 2. Distributed init / NCCL warmup runs in scratch space; the cursor is then forced to `scratch_space_size`.
 3. Model weights, KV pool, and FlashInfer workspace buffers allocate inside the VMM region at byte-deterministic offsets.
 4. `kernel_warmup` is a no-op.
-5. `DecodeCudaGraphRunner.capture` runs the upstream capture loop unchanged (per-shape FlashInfer wrappers and other metadata allocate where sglang puts them); only `FullCudaGraphBackend.capture_one` is patched, to capture into a foundry graph without the two pre-capture warmup forwards.
+5. `DecodeCudaGraphRunner.capture` runs the upstream capture loop unchanged (per-shape FlashInfer wrappers and other metadata allocate where sglang puts them); only `FullCudaGraphBackend.capture_one` is patched, to capture into a foundry graph; of the two pre-capture warmup forwards per shape it keeps one, at the first shape only (LOAD runs the same one).
 6. Each captured graph is written to disk; a manifest groups topologically equivalent graphs.
-7. The final VMM cursor is recorded as `final_alloc_offset` in `region_layout.json`, with `capture_loop_version = 2`.
+7. The final VMM cursor is recorded as `final_alloc_offset` in `region_layout.json`, with `capture_loop_version = 3`.
 
 LOAD:
 
-1. `setup_graph_extension(...)` restores the VMM region and replays captured fatbins into device code memory; an archive without `capture_loop_version = 2` is refused here (re-SAVE).
+1. `setup_graph_extension(...)` restores the VMM region and replays captured fatbins into device code memory; an archive without `capture_loop_version = 3` is refused here (re-SAVE).
 2. Distributed init runs as usual; the cursor advances to the same `scratch_space_size`.
 3. Model weights and KV pool re-allocate at the same deterministic offsets. `init_memory_pool` reuses the saved `MemoryPoolConfig` (and calls `torch.cuda.empty_cache()` to mirror SAVE's `_resolve_memory_pool_config` side effect).
-4. `DecodeCudaGraphRunner.capture` preallocates the deterministic range up to `final_alloc_offset`, starts all decode graph builds in one `start_graph_builds(all_paths)` call (the manifest's template/on-demand linking needs one call), then runs the same upstream capture loop as SAVE. The patched `capture_one` takes the next archived graph for each shape (`finish_one_graph_load`: its allocator events replay where SAVE captured it) instead of capturing; `forward_fn` never runs.
+4. `DecodeCudaGraphRunner.capture` preallocates the deterministic range up to `final_alloc_offset`, starts all decode graph builds in one `start_graph_builds(all_paths)` call (the manifest's template/on-demand linking needs one call), then runs the same upstream capture loop as SAVE. The patched `capture_one` takes the next archived graph for each shape (`finish_one_graph_load`: its allocator events replay where SAVE captured it) instead of capturing; `forward_fn` runs once, as the warm-up forward at the first shape.
 5. The restored graphs sit in the backend's `_graphs` / `_outputs` under the loop's own shape keys; the rest of SGLang's serving path runs unchanged.
 
 ## Doc set

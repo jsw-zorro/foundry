@@ -91,8 +91,9 @@ flashinfer backend pins 8 MiB per captured batch size). Each variable keeps a va
 
 **Warm the JIT caches once per machine and model before the first SAVE:** run the recipe
 once without `--save`/`--load`, wait for `/health`, stop it.
-SAVE runs no eager forward, so each shape's first forward, and with it the first load of
-every JIT kernel (Triton, DeepGEMM, FlashInfer), happens inside the capture window. Plain
+SAVE runs one eager forward, at the first captured shape; every other shape's first forward,
+and with it the first load of its JIT kernels (Triton, DeepGEMM, FlashInfer), happens inside
+the capture window. Plain
 SGLang's pre-capture warmup forwards build every kernel with capture-mode inputs, so
 afterwards the caches under `SGLANG_CACHE_DIR` hold exactly the artifacts SAVE loads. An
 eager run (`--disable-cuda-graph`) is not a substitute: it builds kernels for different
@@ -592,17 +593,29 @@ saved before this (or without the flag) still load unchanged, but their template
 before, so they do not get that speedup: re-SAVE to get it. The format stays v2, so older foundry builds read new
 archives too.
 
-**Archive compatibility note (decode capture loop).** `region_layout.json` records `capture_loop_version = 2`: SAVE
-and LOAD both run sglang's own decode capture loop and substitute only the capture. LOAD refuses, at setup, an
-archive without it or with another value (saved by the older pre-pass code, whose allocation order it cannot
-replay): re-SAVE.
+**Archive compatibility note (decode capture loop).** `region_layout.json` records `capture_loop_version = 3`: SAVE
+and LOAD both run sglang's own decode capture loop, substitute only the capture and run one warm-up forward at each
+capture scope's first shape. LOAD refuses, at setup, an archive without it or with another value (saved by older
+code, whose allocation order it cannot replay): re-SAVE.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| LOAD aborts at setup: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the current code` | Archive saved by the older decode capture code. `rm -rf` it and re-SAVE. |
-| `Reserved address … != requested base 0x600000000000` | VMM base collided with another allocation. Re-run; non-deterministic, the next run usually succeeds. |
+| LOAD aborts at setup: `Foundry archive ... has capture_loop_version=2, this code needs 3: re-SAVE with the current code` | Archive saved by older Foundry code. `rm -rf` it and re-SAVE. |
+| `[Foundry] the CUDA hook is not preloaded in this process: cuMemAlloc_v2 resolves to ...` | `libcuda_hook.so` is not in the scheduler's `LD_PRELOAD`: check `hook_library_path`, and launch through `sglang serve` / `launch_server` / `Engine` (Ray actors are refused) with `FOUNDRY_GRAPH_EXTENSION_CONFIG` set before the launcher first loads sglang's plugins. |
+| `[Foundry] the server args were resolved without Foundry's resolution hooks` | A process that had not loaded sglang's plugins resolved the record and passed it to a child that serves it (sglang's `HttpServerEngineAdapter`, or `http_server.launch_server` in a child process). Call `sglang.srt.plugins.load_plugins()` with `FOUNDRY_GRAPH_EXTENSION_CONFIG` set before the server args are resolved, or launch with `sglang serve` / `launch_server` / `Engine`. |
+| `[Foundry] FOUNDRY_GRAPH_EXTENSION_CONFIG is ..., but this process activated Foundry with ...` | A second engine in one Python process after the variable changed or was unset. sglang loads plugins once per process; start each engine with another config, or a native engine, in a new process. |
+| `[Foundry] SGLang save/load needs torch's native caching allocator without expandable segments` | `PYTORCH_CUDA_ALLOC_CONF` sets `expandable_segments:True` or `backend:cudaMallocAsync`; the hook does not see that memory. Unset it for SAVE and LOAD. |
+| `[Foundry] at the layout start, N caching-allocator segment(s) outside the allocation region hold live tensors` | A thread other than the scheduler's allocated device memory that live tensors still use (a model's own weight-loading thread pool, which Foundry does not run synchronously). Report the model; the archive would address these tensors at other addresses on LOAD. |
+| `[Foundry] N model tensor(s) are outside the allocation region` | A parameter or buffer of the model was not allocated by the scheduler thread inside the region (or in a reservation of 2 GiB or more that the hook places at a fixed address after it): imported from another process (weight cache), mapped from host memory, or created by a loader thread. Its address differs between SAVE and LOAD. Report the model and the load options. |
+| `Foundry LOAD: distributed init left other allocations below the weights than on SAVE` | LOAD's NCCL build or settings, the host's multicast support (torch symmetric memory) or the cuBLAS workspace size differ from SAVE's; the graphs address those allocations. Serve with SAVE's environment or re-SAVE on this host. |
+| `Foundry LOAD: ... come from different SAVE runs` | Two engines wrote one `workspace_root` at the same time, or the archive was assembled from several copies. Give each engine its own `workspace_root` and re-SAVE. |
+| `NVSHMEM initialization of the restored modules failed` | The NVSHMEM host library DeepEP uses is not visible process-wide; put it in `LD_PRELOAD` (`nvshmem_host_path` in the Foundry TOML). |
+| `Reserved address … != requested base 0x600000000000`, then `RuntimeError: Foundry: the allocation region ... could not be reserved at its base` | VMM base collided with another mapping (the `[HOOK] DIAG` lines list it). LOAD reserves the region before restoring modules, which removes the collision with the driver's own VA; on a host with `vm.mmap_rnd_bits=32` the python executable can sit in the range: use `base_addr = 0x400000000000` for SAVE and LOAD. |
+| `[HOOK] ERROR: cuMemAlloc_v2: ... do not fit in the allocation region (region_size ...)` and a CUDA out-of-memory error | The region is smaller than what sglang allocates in it (weights, KV pool, graphs). Raise `region_size` for SAVE and LOAD. |
+| `Foundry LOAD: archive ... was saved by an older Foundry, whose fingerprint does not record ...: re-SAVE` | The archive predates fields the fingerprint now records (for example `region base_addr` and `region_size`). Re-SAVE with the current code. |
+| `[HOOK] ERROR: a reservation of ... bytes must start at 0x... (after the allocation region) on SAVE and LOAD alike; refused` | A mapping occupies the range after the region where the NVSHMEM heap (DeepEP) is placed; the graphs address that heap. Use another `base_addr` (`FOUNDRY_ALLOW_RELOCATED_RESERVE=1` accepts the relocation when no graph addresses the reservation). |
 | EP replay `illegal memory access` / `nvshmemx_cumodule_init not found` | `libnvshmem_host.so.3` not preloaded — foundry couldn't auto-detect the `nvidia-nvshmem` wheel. Confirm it's installed (`pip show nvidia-nvshmem-cu13`), or set `nvshmem_host_path` in both TOMLs. |
 | `NVSHMEM device library version does not match with NVSHMEM host library version`, then segfault | A custom `nvshmem_host_path` in `foundry.toml` points at a different NVSHMEM build than the one inside the `sgl-deep-ep` wheel. Remove the override; foundry's auto-detected `nvidia-nvshmem` wheel matches. |
 | `nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2` | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` too high for `NVSHMEM_QP_DEPTH`; lower it or raise the QP depth. |

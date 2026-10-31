@@ -15,7 +15,7 @@ steps (`apply_inkling_prefill_cuda_graph_default`, `handle_cuda_graph_config`, `
 | 1b | `ModelRunner.init_torch_distributed` (end; target runner only) | `skip_to_scratch_boundary()`: weights start at `scratch_space_size` | same |
 | 2 | `KVCacheConfigurator._resolve_memory_pool_config` | run upstream, record the context overrides it issued (e.g. the Mamba/GDN state-pool size) | skip profiling: `gc.collect()` + `empty_cache()` (mirrors SAVE's side effects), return the saved `MemoryPoolConfig`, replay the overrides |
 | 2b | `ModelRunner.alloc_memory_pool` | write `warmup_state.json` (pool config + overrides) | pass-through with offset logging |
-| 3 | `FullCudaGraphBackend.capture_one` | capture into a `foundry.CUDAGraph` (no warmup forwards), `save_graph` | both runners: hand back the next archived graph for this shape (`restore_next_decode_graph` / `restore_next_prefill_graph`, order checked against the archive); its allocator events replay here (`finish_one_graph_load`); `forward_fn` is not run. `hooks.capture_one` takes the shape, `forward_fn`, the pool and the stream (the prefill request-slot count comes from the enclosing `capture_scope("prefill", ...)`) and returns `(graph, output)`; the caller stores them (the plugin's wrapper here, SGLang's backend on the dependency route) |
+| 3 | `FullCudaGraphBackend.capture_one` | at each capture scope's first shape one eager warm-up forward (`_warm_up_first_shape`, then the attention backend's `post_warmup_hook`), then capture into a `foundry.CUDAGraph`, `save_graph` | both runners: the same warm-up forward at the scope's first shape, then hand back the next archived graph for this shape (`restore_next_decode_graph` / `restore_next_prefill_graph`, order checked against the archive); its allocator events replay here (`finish_one_graph_load`); `forward_fn` runs only in the warm-up. `hooks.capture_one` takes the shape, `forward_fn`, the pool and the stream (the prefill request-slot count comes from the enclosing `capture_scope("prefill", ...)`) and returns `(graph, output)`; the caller stores them (the plugin's wrapper here, SGLang's backend on the dependency route) |
 | 3b | `DecodeCudaGraphRunner.capture` | pre-capture bootstraps and layout start, upstream capture loop, manifest, `pack_fatbins`, `record_region_layout` (with `capture_loop_version`) | bootstraps, `preallocate_for_load_mode`, `start_decode_graph_restore` (one `start_graph_builds`), upstream capture loop with 3 swapping each capture for the archived graph, `finish_decode_graph_restore` (count check), `empty_cache()` |
 | 3c | `PrefillCudaGraphRunner.capture` | full backend only; bootstraps if it runs first | same as 3b for the prefill graphs: `start_prefill_graph_restore`, upstream loop with 3 swapping each capture (order and shape checked), `finish_prefill_graph_restore` |
 | 3d | `DecodeCudaGraphRunner._resolve_shared_read_ends` | - | `POST_REPLAY` fence for restored graphs (they carry no in-graph shared-read marker; see [`known-issues.md`](known-issues.md#event-record-nodes-todo-2026-10-02)) |
@@ -46,16 +46,20 @@ checks the count and logs `[Foundry] Loaded N SGLang graphs in X s (builds B s, 
 work, and `[Foundry] SGLang decode capture loop on LOAD: Y s (N shapes, restore X s, per-shape prep Z s)` for the loop
 wall (the prefill runner logs the same pair; see [`save-load-workflow.md`](save-load-workflow.md)).
 
-**Archive compatibility.** SAVE writes `capture_loop_version = 2` (`runtime.CAPTURE_LOOP_VERSION`) into each rank's
-`region_layout.json`. LOAD checks it at setup (`check_capture_loop_version`, right after `setup_graph_extension`,
-before the weight load) and refuses an archive without it or with another value; archives saved by the pre-pass code
-must be re-saved.
+**Archive compatibility.** SAVE writes `capture_loop_version = 3` (`runtime.CAPTURE_LOOP_VERSION`) into each rank's
+`region_layout.json`. LOAD checks it at setup (`check_capture_loop_version`, inside `setup_graph_extension`, before
+the archived modules and the weights load) and refuses an archive without it or with another value: archives saved
+before the warm-up forward (version 2) or by the pre-pass code must be re-saved. A version-3 archive must also hold
+`fingerprint.json`, the scratch boundary and the offset trail; LOAD stops when one is missing.
 
 The alloc-offset log lines (`[Foundry] SGLang alloc_offset[<point>]=...`) mark each step: `after_setup_graph_ext`,
 `after_init_parallel_runtime`, `after_init_torch_dist`, `after_scratch_skip`, `before/after_init_memory_pool`, the
 bootstrap points below, `before/after_preallocate`, `before/after_prefill_restore` (prefill graphs on),
-`before_decode_restore`, `after_load_all_graphs` (must equal SAVE's `final_alloc_offset`),
-`after_post_load_empty_cache`.
+`prefill_scope_end`, `decode_scope_start`, `before/after_<scope>_warmup`, `before_decode_restore`,
+`after_load_all_graphs` (must equal SAVE's `final_alloc_offset`), `decode_scope_end`, `after_post_load_empty_cache`.
+SAVE records the offset at every point from `after_setup_graph_ext` on; LOAD compares every point both modes log and
+stops at the first difference. At `after_scratch_skip` LOAD also compares the ranges distributed init left live
+below the weights (communicators, symmetric-memory buffers the graphs address) with SAVE's.
 
 ## Pre-capture bootstraps and EP additions
 
@@ -90,10 +94,23 @@ all-reduce through torch symmetric memory (validated attn-TP + EP rows up to att
   inside the first captured forward: inductor's pattern-matcher lazy init (an unpinned
   host-to-device copy) and DeepGEMM's runtime init (`cudaFree(nullptr)`). SAVE runs them
   directly, with the allocation region suspended so their transient tensors never move the
-  deterministic cursor. Everything else the model does lazily (torch.compile of its
-  functions, DeepGEMM per-shape JIT compile and `cuLibraryLoadFromFile`) happens inside the
-  captured forward and is recorded like any other capture-time event. No eager forward runs
-  on either mode, and SAVE and LOAD reach the layout start at the same cursor.
+  deterministic cursor. DeepGEMM per-shape JIT compiles and `cuLibraryLoadFromFile` happen
+  in the forward that first needs them and are recorded like any other event. SAVE and LOAD
+  reach the layout start at the same cursor.
+- **Warm-up forward** (`_warm_up_first_shape`, both modes, at each capture scope's first
+  shape). What the model builds lazily on its first forward (the RoPE cos/sin cache
+  converted to the activation dtype by mrope and by the fallback rotary kernel for head
+  sizes outside 64/128/256/512, the local expert map of EP without an all-to-all backend)
+  would otherwise be created inside the first captured graph only: the other graphs and
+  eager code would read memory that only that graph's replay writes. One eager forward
+  before that shape's capture (SAVE) or restore (LOAD) creates it as an ordinary
+  allocation, at the same address on both modes and with its contents written; the
+  offset checkpoints around it are compared. The forward's transient memory is returned to
+  the driver on both modes (`empty_cache`; on LOAD the hook releases the segments of the
+  preallocated span it mapped on demand for it once they are free). sglang itself runs two
+  warm-up forwards before every shape; state a model creates lazily for a shape other than
+  the first one is not covered. On the dependency route the warm-up needs an adapter that
+  passes `post_warmup_hook` (integration API 2.1); an older adapter runs without it.
 - **No backend-specific code.** LOAD runs the upstream loop, so sglang itself re-creates all per-shape host state
   (FlashInfer / fa3 / hybrid decode metadata, the `deepep_adapter` captured mode, TBO / LoRA buffers) exactly as on
   SAVE. The earlier FlashInfer pre-pass, reuse shim, post-load fa3 metadata pass and explicit
