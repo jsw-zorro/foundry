@@ -29,7 +29,7 @@ import torch.distributed as dist
 from _helpers import (
     free_port,
     map_saved_layout,
-    run_phase,
+    run_phase_on_free_port,
     save_layout,
 )
 
@@ -223,7 +223,7 @@ def saved(tmp_path_factory):
     def get(algo):
         if algo not in archives:
             work = tmp_path_factory.mktemp(f"symm_mem_{algo}")
-            run_phase(__file__, "save", work, algo, env=_env())
+            run_phase_on_free_port(__file__, "save", work, algo, env_fn=_env)
             archives[algo] = None if (work / "archive" / NO_MULTICAST).exists() else work
         if archives[algo] is None:
             pytest.skip("the symmetric-memory rendezvous has no multicast object")
@@ -235,7 +235,7 @@ def saved(tmp_path_factory):
 @pytest.mark.parametrize("load_api", ["single", "parallel"])
 @pytest.mark.parametrize("algo", ["two_shot", "one_shot", "multimem"])
 def test_symm_mem_allreduce_save_load(saved, algo, load_api):
-    run_phase(__file__, "load", saved(algo), algo, load_api, env=_env())
+    run_phase_on_free_port(__file__, "load", saved(algo), algo, load_api, env_fn=_env)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ import sys
 import pytest
 import torch
 import torch.distributed as dist
-from _helpers import free_port, run_phase
+from _helpers import free_port, run_phase_on_free_port
 
 BASE_ADDR = 0x600000000000  # 96 TB
 REGION_SIZE_STR = "512GB"
@@ -283,8 +283,8 @@ def _load_rank(local_rank: int, archive: str, case: str):
 
 @pytest.mark.parametrize("case", list(CASES))
 def test_deepep_low_latency_dispatch_save_load(workdir, case):
-    run_phase(__file__, "save", workdir, case, env=_env(), preload_nvshmem=True)
-    run_phase(__file__, "load", workdir, case, env=_env(), preload_nvshmem=True)
+    run_phase_on_free_port(__file__, "save", workdir, case, env_fn=_env, preload_nvshmem=True)
+    run_phase_on_free_port(__file__, "load", workdir, case, env_fn=_env, preload_nvshmem=True)
 
 
 if __name__ == "__main__":

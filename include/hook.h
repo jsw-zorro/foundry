@@ -24,7 +24,10 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion, cuuin
 
 namespace foundry {
 
-void set_allocation_region(void* base, size_t size);
+// Reserve [base, base + size) at exactly `base` and enable it on the calling
+// thread. Returns false (after a [HOOK] ERROR line) when the range cannot be
+// reserved there; the region is then disabled.
+bool set_allocation_region(void* base, size_t size);
 void stop_allocation_region();
 void resume_allocation_region();
 bool allocation_region_enabled();
@@ -57,8 +60,14 @@ class SuspendAllocationRegion {
 // in an unbacked hole of the span are backed on demand.
 bool preallocate_region(size_t size);
 std::vector<std::pair<size_t, size_t>> get_live_region_ranges();
+std::vector<std::pair<size_t, size_t>> get_reserved_region_ranges();
+// (offset from the region base, size) of the reservations of 2 GiB or more placed at their fixed
+// address after the region.
+std::vector<std::pair<size_t, size_t>> get_placed_reservation_ranges();
 bool preallocate_ranges(const std::vector<std::pair<size_t, size_t>>& ranges, size_t end_offset);
-void free_preallocated_region();
+// Unmap the preallocated span; returns false (and keeps it) while allocations
+// in it are live.
+bool free_preallocated_region();
 size_t get_current_alloc_offset();
 void set_current_alloc_offset(size_t offset);
 void set_pack_fatbins_on_exit(bool enabled);

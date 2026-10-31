@@ -222,6 +222,201 @@ def _run_replay(archive):
     print("[TEST] replay OK")
 
 
+def _run_exhaustion(archive):
+    """An allocation that does not fit in the rest of the region fails with
+    out-of-memory and leaves the cursor in place: an enabled region never hands
+    out an address of the driver's choosing (a graph captured with it would
+    point elsewhere on LOAD)."""
+    import foundry as fdry
+
+    torch.cuda.init()
+    size = 64 * MB
+    fdry.set_allocation_region(BASE_ADDR, size)
+    try:
+        a = torch.empty(48 * MB, dtype=torch.uint8, device="cuda")
+        _assert_in_region([a], BASE_ADDR, size)
+        offset = fdry.get_current_alloc_offset()
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            torch.empty(48 * MB, dtype=torch.uint8, device="cuda")
+        assert fdry.get_current_alloc_offset() == offset, "a refused allocation moved the cursor"
+        # 48 + 12 MB still fits (above 10 MB torch's segment is the request rounded to 2 MB).
+        b = torch.empty(12 * MB, dtype=torch.uint8, device="cuda")
+        _assert_in_region([b], BASE_ADDR, size)
+    finally:
+        fdry.stop_allocation_region()
+    print("[TEST] exhaustion OK")
+
+
+def _run_reserve_failure(archive):
+    """A region whose range is already reserved (here by this process, on
+    another thread: the region state is per thread) raises, through both APIs,
+    instead of leaving the allocations outside the region."""
+    import threading
+
+    import foundry as fdry
+
+    torch.cuda.init()
+    fdry.set_allocation_region(BASE_ADDR, REGION_SIZE)
+    errors = []
+
+    def other_thread():
+        torch.cuda.set_device(0)
+        try:
+            fdry.set_allocation_region(BASE_ADDR, REGION_SIZE)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        try:
+            with fdry.allocation_region(BASE_ADDR, REGION_SIZE):
+                pass
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    t = threading.Thread(target=other_thread)
+    t.start()
+    t.join()
+    fdry.stop_allocation_region()
+    assert len(errors) == 2 and all("could not be reserved" in e for e in errors), errors
+    print("[TEST] reserve failure OK")
+
+
+def _run_free_live_span(archive):
+    """free_preallocated_region keeps the span mapped while an allocation in
+    it is live: unmapping it would leave the tensor on unmapped memory."""
+    import foundry as fdry
+
+    torch.cuda.init()
+    fdry.set_allocation_region(BASE_ADDR, REGION_SIZE)
+    try:
+        assert fdry.preallocate_region(64 * MB), "preallocation"
+        t = torch.full((4 * MB,), 3, dtype=torch.uint8, device="cuda")
+        assert not fdry.free_preallocated_region(), "released a span with a live tensor in it"
+        assert int(t.sum().item()) == 3 * 4 * MB, "the live tensor lost its memory"
+        del t
+        torch.cuda.empty_cache()
+        assert fdry.free_preallocated_region(), "the empty span was not released"
+    finally:
+        fdry.stop_allocation_region()
+    print("[TEST] free live span OK")
+
+
+def _run_span_and_later_region(archive):
+    """A preallocated span that stays mapped (a live tensor in it) serves no
+    allocation of a region set later at a lower base: releasing the span
+    afterwards must leave that region's tensors mapped."""
+    import foundry as fdry
+
+    torch.cuda.init()
+    high = BASE_ADDR + 4 * REGION_SIZE
+    fdry.set_allocation_region(high, REGION_SIZE)
+    assert fdry.preallocate_region(64 * MB), "preallocation"
+    kept = torch.full((4 * MB,), 1, dtype=torch.uint8, device="cuda")
+    assert not fdry.free_preallocated_region(), "released a span with a live tensor in it"
+    fdry.stop_allocation_region()
+    fdry.set_allocation_region(BASE_ADDR, REGION_SIZE)
+    try:
+        # Larger than what is left of the segment holding `kept`: a new allocation.
+        t = torch.full((64 * MB,), 2, dtype=torch.uint8, device="cuda")
+        _assert_in_region([t])
+        del kept
+        torch.cuda.empty_cache()
+        assert fdry.free_preallocated_region(), "the empty span was not released"
+        assert int(t.sum().item()) == 2 * 64 * MB, "a tensor of the later region lost its memory"
+    finally:
+        fdry.stop_allocation_region()
+    print("[TEST] span and later region OK")
+
+
+def _ctx_create_and_alloc(count):
+    """cuCtxCreate on this thread, then ``count`` 1 GiB cuMemAlloc_v2 calls
+    through the hook; returns their addresses (freed, context destroyed)."""
+    import ctypes
+
+    hooked, real = ctypes.CDLL(None), ctypes.CDLL("libcuda.so.1")
+    u64, ptr = ctypes.c_uint64, ctypes.POINTER
+    real.cuInit.argtypes = [ctypes.c_uint]
+    real.cuDeviceGet.argtypes = [ptr(ctypes.c_int), ctypes.c_int]
+    real.cuCtxDestroy_v2.argtypes = [ctypes.c_void_p]
+    hooked.cuCtxCreate_v2.argtypes = [ptr(ctypes.c_void_p), ctypes.c_uint, ctypes.c_int]
+    hooked.cuMemAlloc_v2.argtypes = [ptr(u64), ctypes.c_size_t]
+    hooked.cuMemFree_v2.argtypes = [u64]
+    assert real.cuInit(0) == 0
+    dev, ctx = ctypes.c_int(), ctypes.c_void_p()
+    assert real.cuDeviceGet(ctypes.byref(dev), 0) == 0
+    assert hooked.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev) == 0
+    ptrs = []
+    try:
+        for _ in range(count):
+            p = u64()
+            rc = hooked.cuMemAlloc_v2(ctypes.byref(p), 1 << 30)
+            assert rc == 0, f"cuMemAlloc_v2 of 1 GiB returned {rc}"
+            ptrs.append(p.value)
+    finally:
+        for p in ptrs:
+            hooked.cuMemFree_v2(p)
+        real.cuCtxDestroy_v2(ctx)
+    return ptrs
+
+
+def _in_default_region(ptrs):
+    base, size = 0x500000000000, 2 << 30
+    return [base <= p < base + size for p in ptrs]
+
+
+def _run_ctx_default_region(archive):
+    """With FOUNDRY_CTX_DEFAULT_REGION=1 the first cuCtxCreate gives its thread
+    a default 2 GiB region at 0x500000000000, which no SAVE or LOAD
+    configures: an allocation past its end goes to the driver, as before
+    regions were checked, and does not fail."""
+    ptrs = _ctx_create_and_alloc(3)  # 3 x 1 GiB: the third does not fit
+    assert _in_default_region(ptrs) == [True, True, False], [hex(p) for p in ptrs]
+    print("[TEST] cuCtxCreate default region OK")
+
+
+def _run_ctx_keeps_region(archive):
+    """With the opt-in, a cuCtxCreate on a thread that already has a region
+    keeps that region (strict: what does not fit fails)."""
+    import ctypes
+
+    import foundry as fdry
+
+    torch.cuda.init()
+    torch.cuda.set_device(0)
+    base = BASE_ADDR + 8 * REGION_SIZE  # away from the default region
+    fdry.set_allocation_region(base, REGION_SIZE)
+    hooked, real = ctypes.CDLL(None), ctypes.CDLL("libcuda.so.1")
+    u64, ptr = ctypes.c_uint64, ctypes.POINTER
+    real.cuDeviceGet.argtypes = [ptr(ctypes.c_int), ctypes.c_int]
+    real.cuCtxDestroy_v2.argtypes = [ctypes.c_void_p]
+    hooked.cuCtxCreate_v2.argtypes = [ptr(ctypes.c_void_p), ctypes.c_uint, ctypes.c_int]
+    hooked.cuMemAlloc_v2.argtypes = [ptr(u64), ctypes.c_size_t]
+    hooked.cuMemFree_v2.argtypes = [u64]
+    dev, ctx = ctypes.c_int(), ctypes.c_void_p()
+    assert real.cuDeviceGet(ctypes.byref(dev), 0) == 0
+    assert hooked.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev) == 0
+    try:
+        p = u64()
+        assert hooked.cuMemAlloc_v2(ctypes.byref(p), 512 * MB) == 0
+        try:
+            assert base <= p.value < base + REGION_SIZE, hex(p.value)
+            q = u64()
+            rc = hooked.cuMemAlloc_v2(ctypes.byref(q), REGION_SIZE)
+            assert rc == 2, f"1 GiB past the kept region returned {rc}, expected out-of-memory"
+        finally:
+            hooked.cuMemFree_v2(p.value)
+    finally:
+        real.cuCtxDestroy_v2(ctx)
+        fdry.stop_allocation_region()
+    print("[TEST] cuCtxCreate keeps the thread's region OK")
+
+
+def _run_ctx_no_default_region(archive):
+    """Without the opt-in a thread that creates its own context keeps the
+    driver's allocator (processes that only inherit the preload)."""
+    ptrs = _ctx_create_and_alloc(1)
+    assert _in_default_region(ptrs) == [False], [hex(p) for p in ptrs]
+    print("[TEST] cuCtxCreate without a default region OK")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -250,6 +445,35 @@ def test_live_ranges_and_cursor_restore_the_layout(workdir):
     run_phase(__file__, "replay", workdir)
 
 
+def test_allocation_past_the_region_end_fails(workdir):
+    run_phase(__file__, "exhaustion", workdir)
+
+
+def test_occupied_region_base_raises(workdir):
+    run_phase(__file__, "reserve-failure", workdir)
+
+
+def test_live_preallocation_is_not_released(workdir):
+    run_phase(__file__, "free-live-span", workdir)
+
+
+def test_kept_span_serves_no_later_region(workdir):
+    out = run_phase(__file__, "span-later-region", workdir)
+    assert "on demand at" not in out, "an allocation of the later region was served from the span"
+
+
+def test_context_default_region_falls_back_to_the_driver(workdir):
+    run_phase(__file__, "ctx-default-region", workdir, env={"FOUNDRY_CTX_DEFAULT_REGION": "1"})
+
+
+def test_context_gets_no_default_region_without_the_opt_in(workdir):
+    run_phase(__file__, "ctx-no-default-region", workdir)
+
+
+def test_context_keeps_an_existing_region(workdir):
+    run_phase(__file__, "ctx-keeps-region", workdir, env={"FOUNDRY_CTX_DEFAULT_REGION": "1"})
+
+
 if __name__ == "__main__":
     mode, archive, *rest = sys.argv[1:]
     {
@@ -259,4 +483,11 @@ if __name__ == "__main__":
         "--stop-resume": _run_stop_resume,
         "--record": _run_record,
         "--replay": _run_replay,
+        "--exhaustion": _run_exhaustion,
+        "--reserve-failure": _run_reserve_failure,
+        "--free-live-span": _run_free_live_span,
+        "--span-later-region": _run_span_and_later_region,
+        "--ctx-default-region": _run_ctx_default_region,
+        "--ctx-no-default-region": _run_ctx_no_default_region,
+        "--ctx-keeps-region": _run_ctx_keeps_region,
     }[mode](archive, *rest)

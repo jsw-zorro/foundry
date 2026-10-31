@@ -2,6 +2,8 @@
 #include <c10/core/CachingDeviceAllocator.h>
 #include <pybind11/stl.h>
 #include <cstring>
+#include <sstream>
+#include <stdexcept>
 #include "CUDAGraph.h"
 #include "CUDAGraphInternal.h"
 #include "metadata.h"
@@ -21,9 +23,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "set_allocation_region",
       [](uintptr_t base, size_t size) {
-        ::foundry::set_allocation_region(reinterpret_cast<void*>(base), size);
+        if (!::foundry::set_allocation_region(reinterpret_cast<void*>(base), size)) {
+          std::ostringstream msg;
+          msg << "Foundry: the allocation region [0x" << std::hex << base << ", +0x" << size
+              << ") could not be reserved at its base (see the [HOOK] ERROR lines above); "
+                 "re-run, or use another base_addr for both SAVE and LOAD";
+          throw std::runtime_error(msg.str());
+        }
       },
-      py::arg("base"), py::arg("size"), "Set allocation region for CUDA VMM hooks");
+      py::arg("base"), py::arg("size"),
+      "Set allocation region for CUDA VMM hooks; raises RuntimeError when the range cannot "
+      "be reserved at base");
 
   m.def(
       "stop_allocation_region", []() { ::foundry::stop_allocation_region(); },
@@ -42,6 +52,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "get_live_region_ranges", []() { return ::foundry::get_live_region_ranges(); },
       "Live (offset, size) ranges inside the allocation region, relative to its base");
   m.def(
+      "get_reserved_region_ranges", []() { return ::foundry::get_reserved_region_ranges(); },
+      "(offset, size) of the reservations carved from the allocation region, relative to its "
+      "base");
+  m.def(
+      "get_placed_reservation_ranges", []() { return ::foundry::get_placed_reservation_ranges(); },
+      "(offset, size) of the reservations of 2 GiB or more placed at their fixed address after "
+      "the allocation region, relative to its base");
+  m.def(
       "preallocate_ranges",
       [](const std::vector<std::pair<size_t, size_t>>& ranges, size_t end_offset) {
         return ::foundry::preallocate_ranges(ranges, end_offset);
@@ -50,8 +68,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Map only the given live ranges and move the cursor to end_offset (sparse LOAD "
       "preallocation)");
   m.def(
-      "free_preallocated_region", []() { ::foundry::free_preallocated_region(); },
-      "Free the preallocated memory region");
+      "free_preallocated_region", []() { return ::foundry::free_preallocated_region(); },
+      "Free the preallocated memory region; returns False (and keeps it mapped) while "
+      "allocations in it are live");
 
   m.def(
       "get_current_alloc_offset", []() { return ::foundry::get_current_alloc_offset(); },

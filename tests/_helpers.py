@@ -22,7 +22,12 @@ REPO_ROOT = TESTS_DIR.parent
 
 # Foundry switches a child must not inherit from the calling shell; pass them
 # through run_phase(env=...) to set them.
-_STRIPPED_ENV = ("FOUNDRY_ENABLE_EXEC_SHARE", "FOUNDRY_MMAP_ARCHIVE", "FOUNDRY_MODE")
+_STRIPPED_ENV = (
+    "FOUNDRY_CTX_DEFAULT_REGION",
+    "FOUNDRY_ENABLE_EXEC_SHARE",
+    "FOUNDRY_MMAP_ARCHIVE",
+    "FOUNDRY_MODE",
+)
 _TAIL_LINES = 80
 
 
@@ -105,6 +110,20 @@ def run_phase(
     tail = "\n".join(proc.stdout.splitlines()[-_TAIL_LINES:])
     assert proc.returncode == 0, f"{Path(script).name} --{mode} exited {proc.returncode}:\n{tail}"
     return proc.stdout
+
+
+def run_phase_on_free_port(script, mode: str, workdir, *extra, env_fn, attempts: int = 3, **kw):
+    """run_phase with the environment of ``env_fn()``, whose MASTER_PORT is a
+    port found free in this process. The children bind it seconds later, and a
+    process running beside the tests can take it in between (EADDRINUSE): run
+    again with a new port."""
+    for attempt in range(attempts):
+        try:
+            return run_phase(script, mode, workdir, *extra, env=env_fn(), **kw)
+        except AssertionError as exc:
+            if "EADDRINUSE" not in str(exc) or attempt == attempts - 1:
+                raise
+            print(f"[TEST] MASTER_PORT taken before the children bound it; attempt {attempt + 2}")
 
 
 # ---------------------------------------------------------------------------
