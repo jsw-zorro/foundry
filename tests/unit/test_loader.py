@@ -63,10 +63,19 @@ def test_other_cuda_major_is_refused(monkeypatch):
         _loader.check_torch_build()
 
 
-def test_skip_env_disables_the_check(monkeypatch):
+@pytest.mark.parametrize("value", ["1", "true", "YES"])
+def test_skip_env_disables_the_check(monkeypatch, value):
     _fake_build(monkeypatch, "1.0.0", "11.8")
-    monkeypatch.setenv(_loader.SKIP_ENV, "1")
+    monkeypatch.setenv(_loader.SKIP_ENV, value)
     _loader.check_torch_build()
+
+
+@pytest.mark.parametrize("value", ["0", "false", ""])
+def test_skip_env_set_to_off_keeps_the_check(monkeypatch, value):
+    _fake_build(monkeypatch, "1.0.0", "11.8")
+    monkeypatch.setenv(_loader.SKIP_ENV, value)
+    with pytest.raises(ImportError, match=r"built against torch 1\.0\.0"):
+        _loader.check_torch_build()
 
 
 def test_unbuilt_tree_is_not_checked(monkeypatch):

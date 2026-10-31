@@ -12,7 +12,7 @@ re-raising a load failure with the build-time torch/CUDA.
 it only works with the torch (major.minor and CUDA major) it was compiled
 against. Loading it under another torch fails with an undefined-symbol error
 at best and undefined behavior at worst; this check turns that into a
-readable message. ``FOUNDRY_SKIP_TORCH_CHECK=1`` skips it.
+readable message. ``FOUNDRY_SKIP_TORCH_CHECK=1`` (or ``true`` / ``yes``) skips it.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def _remedy(built_torch: str, built_cuda: str) -> str:
 
 def check_torch_build() -> None:
     """Raise ImportError if the installed torch differs from the build torch."""
-    if os.environ.get(SKIP_ENV):
+    if os.environ.get(SKIP_ENV, "").strip().lower() in ("1", "true", "yes"):
         return
     info = _build_info()
     if info is None:
