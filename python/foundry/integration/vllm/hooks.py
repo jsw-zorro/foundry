@@ -119,6 +119,7 @@ def install_hooks(compilation_config: CompilationConfig) -> None:
     )
 
     if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
+        _apply_env_pins()
         # NOTE(liuxs): vllm doesn't allow zero cudagraph_num_of_warmups, hardcode here
         compilation_config.cudagraph_num_of_warmups = 0
         log.info(
@@ -151,6 +152,95 @@ def install_hooks(compilation_config: CompilationConfig) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Environment pins and refused configurations
+# ---------------------------------------------------------------------------
+
+# Set in this process (and so in the engine and worker processes it starts)
+# when unset; a contrary value is refused.
+_ENV_PINS = (
+    (
+        "VLLM_USE_V2_MODEL_RUNNER",
+        "0",
+        "Foundry patches the V1 GPUModelRunner; vLLM picks the V2 runner for some "
+        "architectures, which would SAVE an empty archive",
+    ),
+    (
+        "NCCL_GRAPH_REGISTER",
+        "0",
+        "NCCL registers the user buffers of a captured collective at capture time, "
+        "which LOAD does not repeat",
+    ),
+    (
+        "NCCL_LOCAL_REGISTER",
+        "0",
+        "the same for buffers registered outside capture",
+    ),
+)
+
+
+def _normalize_bool(value: str) -> str:
+    v = value.strip().lower()
+    if v in ("0", "false", "no", "n", "off"):
+        return "0"
+    if v in ("1", "true", "yes", "y", "on"):
+        return "1"
+    return v
+
+
+def _apply_env_pins() -> None:
+    errors = []
+    for name, value, reason in _ENV_PINS:
+        current = os.environ.get(name)
+        if current is None or (current != value and _normalize_bool(current) == value):
+            os.environ[name] = value
+            log.info("[foundry] pin: %s=%s (was %r): %s", name, value, current, reason)
+        elif current != value:
+            errors.append(f"{name}={current!r} (Foundry needs {value}): {reason}")
+    if errors:
+        raise ValueError(
+            "environment not supported with foundry SAVE/LOAD: "
+            + "; ".join(errors)
+            + " -- unset these variables, Foundry sets them"
+        )
+
+
+def _check_supported_config(vllm_config) -> None:
+    """Worker start, before the region is set up: refuse what Foundry cannot
+    save or restore, and turn off custom all-reduce (its kernels read peer
+    buffers registered per captured graph, which LOAD does not register)."""
+    from vllm.config import CUDAGraphMode
+
+    unsupported = []
+    mode = vllm_config.compilation_config.cudagraph_mode
+    if mode not in (CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL):
+        unsupported.append(
+            f"cudagraph_mode {getattr(mode, 'name', mode)}: LOAD restores FULL graphs only "
+            "(--compilation-config.cudagraph_mode FULL_DECODE_ONLY)"
+        )
+    if getattr(vllm_config, "use_v2_model_runner", False):
+        unsupported.append("the V2 model runner (VLLM_USE_V2_MODEL_RUNNER=0)")
+    par = vllm_config.parallel_config
+    if par.pipeline_parallel_size > 1:
+        unsupported.append(
+            "pipeline parallelism: a non-last stage's IntermediateTensors output is not persisted"
+        )
+    if getattr(par, "enable_elastic_ep", False):
+        unsupported.append("elastic EP: graphs recaptured after a scale event are not restored")
+    if vllm_config.lora_config is not None:
+        unsupported.append("LoRA: graphs per number of active adapters are not persisted")
+    if vllm_config.speculative_config is not None:
+        unsupported.append("speculative decoding: the draft graphs are not persisted")
+    if unsupported:
+        raise ValueError("not supported with foundry SAVE/LOAD: " + "; ".join(unsupported))
+    if not par.disable_custom_all_reduce:
+        par.disable_custom_all_reduce = True
+        log.info(
+            "[foundry] pin: disable_custom_all_reduce=True: custom all-reduce reads peer "
+            "buffers registered per captured graph, which LOAD does not register"
+        )
+
+
+# ---------------------------------------------------------------------------
 # VMM region setup around NCCL.
 # ---------------------------------------------------------------------------
 
@@ -165,7 +255,8 @@ def _patch_init_worker_distributed_environment() -> None:
         active = get_graph_extension_mode() != CUDAGraphExtensionMode.NONE
         t0 = time.perf_counter()
         if active:
-            rt.setup_graph_extension(vllm_config.parallel_config)
+            _check_supported_config(vllm_config)
+            rt.setup_graph_extension(vllm_config)
         result = orig(vllm_config, rank, distributed_init_method, local_rank, backend)
         if active:
             rt.skip_to_scratch_boundary()
@@ -277,9 +368,11 @@ def _load_model_with_overlap(runner, do_original_load: Callable, model_loader) -
     if mode == CUDAGraphExtensionMode.NONE:
         return do_original_load()
 
+    rt.log_alloc_offset("before_load_model")
     if mode == CUDAGraphExtensionMode.LOAD:
         rt.preallocate_for_load_mode()
     result = do_original_load()
+    rt.log_alloc_offset("after_load_model")
     if mode == CUDAGraphExtensionMode.LOAD:
         # Start graph template builds AFTER weight load completes.
         # Running them in parallel with weight load slowed weight load
@@ -401,21 +494,30 @@ def _patch_capture_model() -> None:
             return orig(self)
 
         from foundry.integration.vllm.graph_ops import (
+            finish_graph_restore,
             pack_fatbins,
             save_graph_manifest,
         )
 
+        # No warm-up forward before each capture: it would run the compiled model
+        # on SAVE and the uncompiled one on LOAD. install_hooks sets this in the
+        # process that builds the config; a forked worker never ran that line.
+        self.compilation_config.cudagraph_num_of_warmups = 0
+        rt.log_alloc_offset("before_capture_model")
         builders = [
             b for ag_list in self.attn_groups for ag in ag_list for b in ag.metadata_builders
         ]
         rt.prepare_graph_capture(metadata_builders=builders, device=self.device)
 
         result = orig(self)
+        rt.log_alloc_offset("after_capture_model")
 
         if mode == CUDAGraphExtensionMode.SAVE:
             save_graph_manifest()
             pack_fatbins()
+            rt.record_region_layout()
         elif mode == CUDAGraphExtensionMode.LOAD:
+            finish_graph_restore()
             # NOTE(liuxs): see if there is better way to handle it
             from vllm.v1.worker.workspace import unlock_workspace
 
@@ -636,12 +738,13 @@ def _patch_initialize_kv_caches() -> None:
         if ws is None:
             num_gpu = sched.num_blocks
         elif sched.num_blocks != num_gpu:
-            log.warning(
-                "[foundry] num_gpu_blocks mismatch: loaded=%d computed=%d (using loaded)",
-                num_gpu,
-                sched.num_blocks,
+            # The KV cache sizes the buffers the graphs address: the archive was
+            # saved for another block count (block size, KV dtype, model).
+            raise RuntimeError(
+                f"Foundry {mode.value.upper()}: the KV cache has {sched.num_blocks} blocks with "
+                f"these settings, warmup_state.json records {num_gpu}: serve with the settings "
+                "of the first SAVE pass, or remove the archive and SAVE again (both passes)"
             )
-            sched = sched._replace(num_blocks=num_gpu)
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu
         if sched.kv_cache_groups:

@@ -10,6 +10,7 @@ touch foundry's C extension live here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -35,7 +36,7 @@ from foundry.integration.vllm.config import (
 )
 
 if TYPE_CHECKING:
-    from vllm.config import ParallelConfig
+    from vllm.config import VllmConfig
 
 log = init_logger("vllm.foundry.runtime")
 
@@ -128,23 +129,27 @@ def get_state() -> CUDAGraphExtensionState | None:
 # ---------------------------------------------------------------------------
 
 
-def setup_graph_extension(parallel_config: ParallelConfig) -> None:
+def setup_graph_extension(vllm_config: VllmConfig) -> None:
     """VMM region + (LOAD only) CUDA modules. Called BEFORE NCCL."""
     global _state
     cfg = get_config()
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return
 
+    parallel_config = vllm_config.parallel_config
     t_total = time.perf_counter()
     rank = _compute_rank_from_parallel_config(parallel_config)
     workspace_dir = Path(cfg.workspace_root) / f"rank_{rank}"
     cfg.workspace_dir = str(workspace_dir)
     log.info("[foundry] rank=%d workspace_dir=%s", rank, workspace_dir)
+    _reset_layout()
 
     if cfg.mode == CUDAGraphExtensionMode.SAVE:
         if workspace_dir.exists():
             shutil.rmtree(workspace_dir)
         workspace_dir.mkdir(parents=True, exist_ok=True)
+        with open(workspace_dir / _FINGERPRINT_FILE, "w") as f:
+            json.dump(archive_fingerprint(vllm_config), f, indent=1)
 
     elif cfg.mode == CUDAGraphExtensionMode.LOAD:
         fops.set_skip_fatbin_processing(True)
@@ -173,6 +178,9 @@ def setup_graph_extension(parallel_config: ParallelConfig) -> None:
                     f"exist. For multi-rank LOAD, re-run SAVE with the same "
                     f"parallelism topology."
                 )
+        # Before the archived modules load: an archive from other settings or
+        # another GPU is refused with the difference named.
+        check_archive(vllm_config)
         log.info("[foundry] LOAD: loading CUDA modules from %s", cfg.workspace_dir)
         t = time.perf_counter()
         fops.load_cuda_modules_and_libraries(cfg.workspace_dir)
@@ -194,21 +202,227 @@ def setup_graph_extension(parallel_config: ParallelConfig) -> None:
 
 
 def skip_to_scratch_boundary() -> None:
-    """Advance allocator past scratch region. Called AFTER NCCL."""
+    """Advance allocator past scratch region. Called AFTER NCCL.
+
+    Distributed init allocates a host-dependent amount (NCCL version and
+    environment), so weight loading starts at a fixed boundary instead:
+    scratch_space_size, or on SAVE the cursor when distributed init went past
+    it. SAVE records the boundary it used; LOAD moves to the same one, and
+    stops when its own distributed init already went past it."""
     cfg = get_config()
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return
     scratch = parse_size(cfg.scratch_space_size)
     current = fops.get_current_alloc_offset()
-    if current > scratch:
-        log.warning(
-            "[foundry] Current offset %d > scratch_space_size %d. Increase scratch_space_size.",
-            current,
-            scratch,
-        )
+    if cfg.mode == CUDAGraphExtensionMode.SAVE:
+        boundary = max(scratch, current)
+        if current > scratch:
+            log.warning(
+                "[foundry] distributed init allocated %d bytes, more than scratch_space_size "
+                "%d: weights start at %d (raise scratch_space_size)",
+                current,
+                scratch,
+                current,
+            )
+        _layout["scratch_end_offset"] = boundary
+    else:
+        saved = _saved_layout_value("scratch_end_offset")
+        boundary = scratch if saved is None else saved
+        if current > boundary:
+            raise RuntimeError(
+                f"Foundry LOAD: distributed init allocated {current} bytes, past the boundary "
+                f"{boundary} where SAVE's weight loading starts (scratch_space_size "
+                f"{scratch}): raise scratch_space_size and re-SAVE"
+            )
+    log.info("[foundry] Skip to scratch boundary: %d bytes (current was %d)", boundary, current)
+    fops.set_current_alloc_offset(boundary)
+    log_alloc_offset("after_scratch_skip")
+
+
+# ---------------------------------------------------------------------------
+# Archive record: fingerprint (what the archive is valid for) and allocation
+# layout (the boundary and the offsets at fixed checkpoints)
+# ---------------------------------------------------------------------------
+
+_FINGERPRINT_FILE = "fingerprint.json"
+_LAYOUT_FILE = "region_layout.json"
+# SAVE: the boundary and the checkpoint offsets of this run; LOAD: SAVE's record.
+_layout: dict = {}
+_saved_layout: dict | None = None
+
+
+def _reset_layout() -> None:
+    global _layout, _saved_layout
+    _layout = {"offsets": {}}
+    _saved_layout = None
+
+
+def _saved_layout_value(key: str):
+    return None if _saved_layout is None else _saved_layout.get(key)
+
+
+def _json_value(value) -> str:
+    # An object whose str() is the default repr would differ between runs.
+    text = str(value)
+    return type(value).__qualname__ if " at 0x" in text else text
+
+
+def _model_identity(model) -> str | None:
+    """The digest of config.json for a local model directory (the path may
+    differ between hosts), else the path or hub id as given."""
+    if model is None:
+        return None
+    config = os.path.join(str(model), "config.json")
+    if os.path.isfile(config):
+        with open(config, "rb") as f:
+            return "config.json sha256:" + hashlib.sha256(f.read()).hexdigest()
+    return str(model)
+
+
+def _driver_version() -> str | None:
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        version = pynvml.nvmlSystemGetDriverVersion()
+        return version.decode() if isinstance(version, bytes) else str(version)
+    except Exception:
+        pass
+    try:
+        return f"driver API {torch._C._cuda_getDriverVersion()}"
+    except Exception:
+        return None
+
+
+def archive_fingerprint(vllm_config: VllmConfig) -> dict:
+    """What a rank's archive is valid for: the settings that shape the captured
+    graphs or size the buffers they address, the software and the GPU."""
+    from foundry import __version__ as foundry_version
+
+    cfg = get_config()
+    model = vllm_config.model_config
+    sched = vllm_config.scheduler_config
+    cache = vllm_config.cache_config
+    par = vllm_config.parallel_config
+    comp = vllm_config.compilation_config
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+
+    def a(obj, name):
+        return getattr(obj, name, None)
+
+    fp = {
+        "model": _model_identity(a(model, "model")),
+        "revision": a(model, "revision"),
+        "dtype": a(model, "dtype"),
+        "quantization": a(model, "quantization"),
+        "max_model_len": a(model, "max_model_len"),
+        "max_num_seqs": a(sched, "max_num_seqs"),
+        "max_num_batched_tokens": a(sched, "max_num_batched_tokens"),
+        "block_size": a(cache, "block_size"),
+        "cache_dtype": a(cache, "cache_dtype"),
+        "tensor_parallel_size": a(par, "tensor_parallel_size"),
+        "pipeline_parallel_size": a(par, "pipeline_parallel_size"),
+        "data_parallel_size": a(par, "data_parallel_size"),
+        "enable_expert_parallel": a(par, "enable_expert_parallel"),
+        "all2all_backend": a(par, "all2all_backend"),
+        "disable_custom_all_reduce": a(par, "disable_custom_all_reduce"),
+        "cudagraph_mode": a(comp, "cudagraph_mode"),
+        "cudagraph_capture_sizes": a(comp, "cudagraph_capture_sizes"),
+        "region base": hex(cfg.base_addr) if cfg is not None else None,
+        "region size": parse_size(cfg.region_size) if cfg is not None else None,
+        "scratch_space_size": parse_size(cfg.scratch_space_size) if cfg is not None else None,
+        "env CUDA_MODULE_LOADING": os.environ.get("CUDA_MODULE_LOADING"),
+        "vllm version": vllm.__version__,
+        "foundry version": foundry_version,
+        "torch version": torch.__version__,
+        "cuda version": torch.version.cuda,
+        "driver version": _driver_version(),
+        "gpu": props.name,
+        "gpu compute capability": f"{props.major}.{props.minor}",
+        "gpu SMs": props.multi_processor_count,
+        "gpu memory": props.total_memory,
+    }
+    return json.loads(json.dumps(fp, default=_json_value))
+
+
+def check_archive(vllm_config: VllmConfig) -> None:
+    """LOAD, at setup (before the archived modules load): refuse an archive
+    saved under other settings, software or GPU (archive_fingerprint), and
+    read SAVE's allocation layout. FOUNDRY_VLLM_SKIP_FINGERPRINT=1 skips the
+    fingerprint comparison."""
+    global _saved_layout
+    cfg = get_config()
+    if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD or cfg.workspace_dir is None:
         return
-    log.info("[foundry] Skip to scratch boundary: %d bytes (current was %d)", scratch, current)
-    fops.set_current_alloc_offset(scratch)
+    layout_path = os.path.join(cfg.workspace_dir, _LAYOUT_FILE)
+    if not os.path.exists(layout_path):
+        raise RuntimeError(
+            f"Foundry LOAD: {layout_path} not found: the archive was not written by a "
+            "completed SAVE (or by an older Foundry); re-SAVE"
+        )
+    with open(layout_path) as f:
+        _saved_layout = json.load(f)
+    path = os.path.join(cfg.workspace_dir, _FINGERPRINT_FILE)
+    if os.environ.get("FOUNDRY_VLLM_SKIP_FINGERPRINT") == "1":
+        log.warning("[foundry] archive fingerprint not checked (FOUNDRY_VLLM_SKIP_FINGERPRINT=1)")
+        return
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"Foundry LOAD: {path} not found: the archive was written by an older Foundry; "
+            "re-SAVE (FOUNDRY_VLLM_SKIP_FINGERPRINT=1 skips this check)"
+        )
+    with open(path) as f:
+        saved = json.load(f)
+    current = archive_fingerprint(vllm_config)
+    missing = sorted(set(current) - set(saved))
+    if missing:
+        raise RuntimeError(
+            f"Foundry LOAD: archive {cfg.workspace_dir} was saved by an older Foundry, whose "
+            f"fingerprint does not record {', '.join(missing)}: re-SAVE "
+            "(FOUNDRY_VLLM_SKIP_FINGERPRINT=1 skips this check)."
+        )
+    diff = [
+        f"{key}: SAVE {saved.get(key)!r}, LOAD {current.get(key)!r}"
+        for key in sorted(set(saved) | set(current))
+        if saved.get(key) != current.get(key)
+    ]
+    if diff:
+        raise RuntimeError(
+            f"Foundry LOAD: archive {cfg.workspace_dir} was saved under other settings "
+            f"({'; '.join(diff)}). Serve with SAVE's settings or re-SAVE "
+            "(FOUNDRY_VLLM_SKIP_FINGERPRINT=1 skips this check)."
+        )
+    log.info("[foundry] archive fingerprint matches (%d entries)", len(current))
+
+
+def log_alloc_offset(label: str) -> None:
+    """Checkpoint of the allocation layout: SAVE records the cursor offset, LOAD
+    stops at the first checkpoint where it differs from SAVE's (the buffers
+    allocated since the previous checkpoint differ in size or number)."""
+    cfg = get_config()
+    if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
+        return
+    offset = fops.get_current_alloc_offset()
+    log.info("[foundry] alloc_offset[%s] = %d", label, offset)
+    if cfg.mode == CUDAGraphExtensionMode.SAVE:
+        _layout.setdefault("offsets", {})[label] = offset
+        return
+    saved = (_saved_layout_value("offsets") or {}).get(label)
+    if saved is not None and saved != offset:
+        raise RuntimeError(
+            f"Foundry LOAD: allocation offset at {label} is {offset}, SAVE had {saved}: the "
+            "buffers allocated since the previous checkpoint differ (settings, model or "
+            "software that differ from SAVE's). Serve with SAVE's settings or re-SAVE."
+        )
+
+
+def record_region_layout() -> None:
+    """SAVE, after the last capture: write the rank's layout record."""
+    cfg = get_config()
+    if cfg is None or cfg.mode != CUDAGraphExtensionMode.SAVE or cfg.workspace_dir is None:
+        return
+    with open(os.path.join(cfg.workspace_dir, _LAYOUT_FILE), "w") as f:
+        json.dump(_layout, f, indent=1)
 
 
 def capture_final_alloc_offset() -> int:

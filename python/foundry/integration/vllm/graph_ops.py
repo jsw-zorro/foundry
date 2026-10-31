@@ -201,6 +201,16 @@ def capture_or_load_graph(
         index = _pending_graph_builds.identifier_to_index.get(identifier)
         if index is None:
             raise RuntimeError(f"Graph identifier not in pending builds: {identifier}")
+        # The archive holds the graphs in SAVE's capture order, and each graph's
+        # allocations replay where SAVE captured it: the capture loop must ask
+        # for them in the same order.
+        expected = _pending_graph_builds.next
+        if index != expected:
+            raise RuntimeError(
+                f"Foundry LOAD: the capture loop asks for graph {index} ({identifier}), the "
+                f"next archived graph is {expected}: the capture sizes or modes differ from SAVE"
+            )
+        _pending_graph_builds.next += 1
         graph, output = FoundryCUDAGraph.finish_one_graph_load(_pending_graph_builds.pending, index)
         # Strong-reference the (graph, output) pair. The upstream
         # CUDAGraphWrapper stores `entry.output = weak_ref_tensors(output)`,
@@ -230,6 +240,7 @@ def capture_or_load_graph(
 class _PendingGraphBuilds:
     pending: object  # opaque PendingGraphLoads handle from C++
     identifier_to_index: dict[GraphIdentifier, int]
+    next: int = 0  # the next archived graph the capture loop must ask for
 
 
 _pending_graph_builds: _PendingGraphBuilds | None = None
@@ -304,14 +315,36 @@ def start_graph_builds() -> None:
     # Parsed-filename metadata is already in (runtime_mode, batch_descriptor,
     # piecewise_compile_index) shape — the same shape as the runtime identifier
     # built inside capture_or_load_graph — so just reuse it directly.
-    identifier_to_index: dict[GraphIdentifier, int] = {
-        metadata: i for i, (_index, _filename, metadata) in enumerate(graph_files)
-    }
+    identifier_to_index: dict[GraphIdentifier, int] = {}
+    for i, (_index, filename, metadata) in enumerate(graph_files):
+        if metadata in identifier_to_index:
+            raise RuntimeError(
+                f"Foundry LOAD: {filename} has the same graph identifier as another archived "
+                f"graph ({metadata}): the archive cannot tell them apart"
+            )
+        identifier_to_index[metadata] = i
 
     _pending_graph_builds = _PendingGraphBuilds(
         pending=pending,
         identifier_to_index=identifier_to_index,
     )
+
+
+def finish_graph_restore() -> None:
+    """LOAD, after capture_model: every archived graph must have been restored
+    (a graph the capture loop never asked for means its sizes differ from SAVE)."""
+    global _pending_graph_builds
+    r = _pending_graph_builds
+    _pending_graph_builds = None
+    if r is None:
+        return
+    total = len(r.identifier_to_index)
+    if r.next != total:
+        raise RuntimeError(
+            f"Foundry LOAD: the archive holds {total} graphs, the capture loop restored "
+            f"{r.next}: the capture sizes or modes differ from SAVE"
+        )
+    log.info("[foundry] LOAD: restored all %d archived graphs", total)
 
 
 # ---------------------------------------------------------------------------

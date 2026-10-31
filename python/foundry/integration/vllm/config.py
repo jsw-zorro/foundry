@@ -36,7 +36,7 @@ class CUDAGraphExtensionConfig:
     # Path to libnvshmem_host.so for NVSHMEM-based kernels (e.g. DeepEP).
     nvshmem_host_path: str | None = None
     base_addr: int = 0x600000000000
-    region_size: str = "64GB"
+    region_size: str = "256GB"
     workspace_root: str = "foundry_archive"
     workspace_dir: str | None = None
     # Scratch space reserved for non-deterministic NCCL allocations.
